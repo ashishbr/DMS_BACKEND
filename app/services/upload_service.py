@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 import asyncio
 import re
 from typing import List, Set
@@ -290,6 +291,16 @@ class UploadService:
                         
                         document = self._save_to_database(result, filename, db)
                         if document:
+                            # Run financial classification (creates ClientPO/VendorPO/Invoice record)
+                            try:
+                                from app.services.financial_classification_service import FinancialClassificationService
+                                fin_svc = FinancialClassificationService(db)
+                                fin_svc.classify_and_create(document, extracted_data)
+                                db.commit()
+                            except Exception as fin_err:
+                                print(f"⚠️  Financial classification failed for {filename}: {fin_err}")
+                                db.rollback()
+
                             # Generate alerts for the new document
                             alert_generator = AlertGenerator(db)
                             alerts = alert_generator.generate_alerts_for_document(document)
@@ -388,6 +399,8 @@ class UploadService:
             id=document_id,
             **document_create.dict()
         )
+        db_document.processing_status = "PARSED"
+        db_document.extracted_json = json.dumps(extracted_data, default=str)
         db.add(db_document)
         db.commit()
         db.refresh(db_document)

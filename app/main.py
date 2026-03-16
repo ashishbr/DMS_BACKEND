@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine
 from app.models import Base
-from app.routers import dashboard, documents, exceptions, alerts, chat, uploads, processed_documents
+from app.routers import dashboard, documents, exceptions, alerts, chat, uploads, processed_documents, financial
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -36,6 +36,7 @@ app.include_router(alerts.router)
 app.include_router(chat.router)
 app.include_router(uploads.router)
 app.include_router(processed_documents.router)
+app.include_router(financial.router)
 
 @app.get("/")
 async def root():

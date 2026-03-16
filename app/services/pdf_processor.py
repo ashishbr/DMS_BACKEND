@@ -24,6 +24,7 @@ class PDFProcessor:
         # Initialize AWS clients
         self.textract_client = None
         self.s3_client = None
+        self.bedrock_client = None
         self._initialize_aws_clients()
     
     def _initialize_aws_clients(self):
@@ -42,7 +43,8 @@ class PDFProcessor:
             
             self.textract_client = boto3.client('textract', **aws_config)
             self.s3_client = boto3.client('s3', **aws_config)
-            
+            self.bedrock_client = boto3.client('bedrock-runtime', **aws_config)
+
         except Exception as e:
             print(f"Warning: Failed to initialize AWS clients: {e}")
             print("Textract will not be available. Please configure AWS credentials.")
@@ -188,8 +190,13 @@ class PDFProcessor:
                 # If organization failed, just clean up temp file
                 self._cleanup_s3_file(temp_s3_key)
             
-            # Extract structured data
-            extracted_data = self._extract_structured_data(text_content, document_type, "")
+            # Extract structured data — try Bedrock first, fall back to regex
+            try:
+                extracted_data = self._extract_structured_data_bedrock(text_content, document_type)
+                print(f"✅ Extracted structured data via Bedrock")
+            except Exception as bedrock_err:
+                print(f"⚠️  Bedrock extraction failed ({bedrock_err}), falling back to regex extraction")
+                extracted_data = self._extract_structured_data(text_content, document_type, "")
 
             # Force document type based on extracted identifiers
             if extracted_data.get("invoice_number"):
@@ -564,6 +571,61 @@ class PDFProcessor:
         
         return "Unknown"
     
+    def _extract_structured_data_bedrock(self, text: str, document_type: str) -> Dict:
+        """Extract structured data using AWS Bedrock Claude Haiku. Returns empty dict on failure."""
+        if not self.bedrock_client:
+            raise RuntimeError("Bedrock client not initialized")
+
+        import json as _json
+
+        prompt = f"""You are a document extraction assistant. Extract structured data from this {document_type} document.
+
+    Return ONLY valid JSON with these exact fields (use null if not found):
+    {{
+    "title": "string or null",
+    "client": "string or null",
+    "vendor": "string or null",
+    "amount": 0,
+    "currency": "string or null",
+    "date": "YYYY-MM-DD or null",
+    "due_date": "YYYY-MM-DD or null",
+    "po_number": "string or null",
+    "invoice_number": "string or null",
+    "msa_number": "string or null",
+    "vendor_address": "string or null",
+    "client_address": "string or null",
+    "summary": "string or null",
+    "key_terms": ["array", "of", "keyword", "strings"],
+    "contact_info": {{"emails": [], "phones": [], "addresses": []}}
+    }}
+
+    IMPORTANT: key_terms MUST be a JSON array of strings. contact_info MUST be a JSON object.
+
+    Document text:
+    {text[:8000]}"""
+
+        response = self.bedrock_client.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=_json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}]
+            })
+        )
+        result = _json.loads(response['body'].read())
+        data = _json.loads(result['content'][0]['text'])
+
+        # Enforce types to match what the frontend and regex fallback expect
+        if isinstance(data.get("key_terms"), str):
+            data["key_terms"] = [t.strip() for t in data["key_terms"].split(",") if t.strip()]
+        elif not isinstance(data.get("key_terms"), list):
+            data["key_terms"] = []
+
+        if not isinstance(data.get("contact_info"), dict):
+            data["contact_info"] = {}
+
+        return data
+
     def _extract_structured_data(self, text: str, document_type: str, forms_data: str = "") -> Dict:
         """Extract structured data based on document type"""
         # Combine text and forms data for better extraction
@@ -647,7 +709,25 @@ class PDFProcessor:
         """Extract client name with improved patterns"""
         clean_text = text.strip()
         lines = clean_text.split('\n')
-        
+
+        # Look for "ISSUED TO" label (common in PO documents) — skip generic labels
+        _GENERIC_LABELS = {'company', 'address', 'name', 'vendor', 'supplier', 'issued by', 'issued to'}
+        for i, line in enumerate(lines):
+            if 'issued to' in line.lower():
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    next_line = lines[j].strip()
+                    if (next_line
+                            and len(next_line) > 3
+                            and next_line.lower() not in _GENERIC_LABELS):
+                        # Skip the vendor name: take the second real company found
+                        # The vendor name was already captured by _extract_vendor;
+                        # here we look for a different company name that appears after it
+                        vendor = self._extract_vendor(text)
+                        if vendor and next_line == vendor:
+                            continue
+                        return next_line
+                break
+
         # Look for "Bill To" and get the company name on the next line(s)
         for i, line in enumerate(lines):
             line_lower = line.lower().strip()
@@ -712,7 +792,21 @@ class PDFProcessor:
     def _extract_vendor(self, text: str) -> str:
         """Extract vendor name with improved patterns"""
         clean_text = text.strip()
-        
+        lines = clean_text.split('\n')
+
+        # Look for "ISSUED BY" label (common in PO documents) — skip generic "Company" labels
+        _GENERIC_LABELS = {'company', 'address', 'name', 'vendor', 'supplier', 'issued by', 'issued to'}
+        for i, line in enumerate(lines):
+            if 'issued by' in line.lower():
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    next_line = lines[j].strip()
+                    if (next_line
+                            and len(next_line) > 3
+                            and next_line.lower() not in _GENERIC_LABELS
+                            and 'issued to' not in next_line.lower()):
+                        return next_line
+                break
+
         # Enhanced patterns for vendor extraction
         patterns = [
             r"Vendor:\s*(.+?)(?:\n|$)",
@@ -723,7 +817,7 @@ class PDFProcessor:
             r"Company\s+Name[:\s]*(.+?)(?:\n|$)",
             r"Business\s+Name[:\s]*(.+?)(?:\n|$)"
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, clean_text, re.IGNORECASE | re.MULTILINE)
             if match:
@@ -731,21 +825,21 @@ class PDFProcessor:
                 vendor = re.sub(r'\s+', ' ', vendor)
                 if len(vendor) > 3 and len(vendor) < 100:
                     return vendor
-        
+
         # Look for company names in document headers (for vendor invoices)
         company_patterns = [
             r"^([A-Z][A-Z\s&]+(?:LTD|LLC|INC|CORP|COMPANY|LLP))",
             r"^([A-Z][A-Z\s&]+(?:TECHNOLOGY|SERVICES|SOLUTIONS|SYSTEMS))",
             r"^([A-Z][A-Z\s&]+(?:DIGITAL|INFORMATION|CONSULTING))"
         ]
-        
+
         for pattern in company_patterns:
             match = re.search(pattern, clean_text, re.MULTILINE)
             if match:
                 company = match.group(1).strip()
                 if len(company) > 5 and len(company) < 80:
                     return company
-        
+
         return None
     
     def _extract_amount(self, text: str) -> float:
@@ -756,13 +850,13 @@ class PDFProcessor:
         # Priority patterns - look for invoice total, amount due, grand total first
         # Highest priority: Total including VAT (final amount)
         priority_patterns = [
-            (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s+([\d,]+\.?\d*)", 1.0),  # "Total Incl VAT | AED 4,473.48"
+            (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s*([\d,]+\.?\d*)", 1.0),  # "Total Incl VAT | AED 4,473.48"
             (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)", 0.99),  # Without currency code
             (r"Invoice\s+Total\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.95),
             (r"Amount\s+Due\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.94),
-            (r"Grand\s+Total[:\s]*\$?([\d,]+\.?\d*)", 0.9),
+            (r"Grand\s+Total[:\s\n]*\$?\s*([\d,]+\.?\d*)", 0.9),
             (r"Total\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.85),
-            (r"Final\s+Amount[:\s]*\$?([\d,]+\.?\d*)", 0.8),
+            (r"Final\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)", 0.8),
         ]
         
         amounts_with_priority = []
@@ -782,20 +876,20 @@ class PDFProcessor:
             amounts_with_priority.sort(key=lambda x: x[1], reverse=True)
             return amounts_with_priority[0][0]
         
-        # Fallback to all patterns
+        # Fallback to all patterns — \$?\s* handles "$ 125,000.00" (space after $)
         patterns = [
-            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s+([\d,]+\.?\d*)",  # "Total Incl VAT | AED 4,473.48"
-            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)",  # Total including VAT without currency
-            r"Invoice\s+Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Amount\s+Due[:\s]*\$?([\d,]+\.?\d*)",
-            r"Grand\s+Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Total\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Final\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Net\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Balance[:\s]*\$?([\d,]+\.?\d*)",
-            r"Due[:\s]*\$?([\d,]+\.?\d*)",
+            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s*([\d,]+\.?\d*)",
+            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)",
+            r"Invoice\s+Total[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Amount\s+Due[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Grand\s+Total[:\s\n]*\$?\s*([\d,]+\.?\d*)",
+            r"Total\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Final\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Net\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Total[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Balance[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Due[:\s]*\$?\s*([\d,]+\.?\d*)",
         ]
         
         amounts = []
@@ -873,10 +967,13 @@ class PDFProcessor:
         clean_text = text.strip()
         lines = clean_text.split('\n')
         
-        # Look for "Invoice Date" or "Date" label and get the value on the next line
+        # Look for document date labels and get the value on the next line(s)
+        date_label_keywords = ['invoice date', 'po date', 'order date', 'purchase order date', 'issue date', 'issued date']
         for i, line in enumerate(lines):
             line_lower = line.lower().strip()
-            if 'invoice date' in line_lower or ('date' in line_lower and 'invoice' in clean_text[max(0, i-2):i+2].lower()):
+            if any(kw in line_lower for kw in date_label_keywords) or (
+                'date' in line_lower and 'invoice' in clean_text[max(0, i-2):i+2].lower()
+            ):
                 # Get the next non-empty line which should be the date
                 for j in range(i + 1, min(i + 3, len(lines))):
                     next_line = lines[j].strip()
@@ -886,13 +983,18 @@ class PDFProcessor:
                         if date_str:
                             return date_str
         
-        # Enhanced date patterns - handle multiple formats
+        # Enhanced date patterns - handle multiple formats and document types
         patterns = [
-            # Format: "13 Sep 2025" or "13 September 2025"
+            # "DD Mon YYYY" format
             (r"Invoice\s+Date[:\s]*\n\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"PO\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"Order\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"Issue\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
             (r"Date[:\s]*\n\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
-            # Format: "13/09/2025" or "13-09-2025"
+            # "DD/MM/YYYY" or "DD-MM-YYYY" format
             (r"Invoice\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
+            (r"PO\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
+            (r"Order\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Issue\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Created[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
@@ -1132,36 +1234,51 @@ class PDFProcessor:
                             if len(invoice_number) > 2:
                                 return invoice_number
         
-        # Enhanced invoice number patterns (fallback)
+        # Words that look like invoice number matches but aren't
+        _INVOICE_EXCLUDED = {'date', 'number', 'no', 'total', 'amount', 'due', 'from', 'to', 'period', 'tax'}
+
+        # Enhanced invoice number patterns (fallback) — must contain at least one digit
         patterns = [
             r"Invoice\s+Number[:\s]*\n\s*([A-Z0-9/_-]+)",
-            r"Invoice\s*#?\s*([A-Z0-9/_-]+)",
-            r"Inv\s*#?\s*([A-Z0-9/_-]+)",
-            r"Bill\s*#?\s*([A-Z0-9/_-]+)",
+            r"Invoice\s*#\s*([A-Z0-9/_-]+)",       # explicit # required here
+            r"Inv\s*#\s*([A-Z0-9/_-]+)",            # explicit # required here
+            r"Bill\s*#\s*([A-Z0-9/_-]+)",           # explicit # required here
+            r"Invoice\s+No\.?\s*:?\s*([A-Z0-9/_-]+)",
             r"Invoice\s+Number[:\s]*([A-Z0-9/_-]+)",
             r"Bill\s+Number[:\s]*([A-Z0-9/_-]+)",
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, clean_text, re.IGNORECASE | re.MULTILINE)
             if match:
                 invoice_number = match.group(1).strip()
-                if len(invoice_number) > 2:
+                # Must contain at least one digit and not be a common non-number word
+                if (len(invoice_number) > 2
+                        and re.search(r'\d', invoice_number)
+                        and invoice_number.lower() not in _INVOICE_EXCLUDED):
                     return invoice_number
-        
+
         return None
     
     def _extract_vendor_address(self, text: str) -> Optional[str]:
         """Extract vendor address with improved patterns"""
         clean_text = text.strip()
         lines = clean_text.split('\n')
-        
-        # Enhanced vendor address patterns
-        vendor_keywords = ['vendor', 'supplier', 'from', 'company address', 'business address', 'headquarters']
-        
+
+        # More specific vendor address triggers — avoid compound phrases like "LINKED VENDOR PO"
+        # that contain "vendor" but are not address sections.
+        _VENDOR_ADDR_LABELS = [
+            r'\bvendor\s+address\b', r'\bsupplier\s+address\b',
+            r'\bfrom\b', r'\bcompany\s+address\b',
+            r'\bbusiness\s+address\b', r'\bheadquarters\b',
+        ]
+        # Also match a line that is ONLY "vendor" or "supplier" (a section header)
+        _VENDOR_SECTION_ONLY = re.compile(r'^\s*(vendor|supplier)\s*$', re.IGNORECASE)
+
         for i, line in enumerate(lines):
             line_lower = line.lower()
-            if any(keyword in line_lower for keyword in vendor_keywords):
+            if (any(re.search(pat, line_lower) for pat in _VENDOR_ADDR_LABELS)
+                    or _VENDOR_SECTION_ONLY.match(line)):
                 address_lines = []
                 for j in range(i+1, min(i+6, len(lines))):
                     current_line = lines[j].strip()
