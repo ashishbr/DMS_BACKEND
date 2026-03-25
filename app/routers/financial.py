@@ -28,6 +28,7 @@ from app.repositories.client_invoice_repository import ClientInvoiceRepository
 from app.services.margin_service import MarginService
 from app.services.billing_validation_service import BillingValidationService
 from app.services.invoice_matching_service import InvoiceMatchingService
+from app.services.alert_generator import AlertGenerator
 from app.schemas import (
     ClientPOCreate, ClientPOUpdate, ClientPOResponse,
     VendorPOCreate, VendorPOUpdate, VendorPOResponse,
@@ -92,6 +93,17 @@ async def update_client_po(
         if not updated:
             raise HTTPException(status_code=404, detail="Client PO not found")
         db.commit()
+
+        # Refresh utilization alerts for the linked document
+        try:
+            from app.models import Document
+            doc = db.query(Document).filter(Document.id == updated.document_id).first()
+            if doc:
+                AlertGenerator(db).generate_alerts_for_document(doc)
+                db.commit()
+        except Exception:
+            db.rollback()
+
         return updated
     except HTTPException:
         raise
@@ -172,6 +184,18 @@ async def update_vendor_po(
         if not updated:
             raise HTTPException(status_code=404, detail="Vendor PO not found")
         db.commit()
+
+        # Re-run billing check + refresh alerts for the linked document
+        try:
+            BillingValidationService(db).check_vendor_po_overbilling(vendor_po_id)
+            from app.models import Document
+            doc = db.query(Document).filter(Document.id == updated.document_id).first()
+            if doc:
+                AlertGenerator(db).generate_alerts_for_document(doc)
+            db.commit()
+        except Exception:
+            db.rollback()
+
         return updated
     except HTTPException:
         raise
@@ -392,6 +416,17 @@ async def update_vendor_invoice(
         if not updated:
             raise HTTPException(status_code=404, detail="Vendor invoice not found")
         db.commit()
+
+        # Re-run matching + billing check after any update
+        try:
+            InvoiceMatchingService(db).run_full_validation(updated)
+            if updated.vendor_po_id:
+                BillingValidationService(db).check_vendor_po_overbilling(updated.vendor_po_id)
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        db.refresh(updated)
         return updated
     except HTTPException:
         raise
@@ -426,7 +461,26 @@ async def create_client_invoice(payload: ClientInvoiceCreate, db: Session = Depe
     try:
         inv = ClientInvoice(id=str(uuid.uuid4()), **payload.model_dump())
         created = ClientInvoiceRepository(db).create(inv)
+
+        # Auto-advance ClientPO to ACTIVE on first linked invoice
+        if created.client_po_id:
+            cpo = ClientPORepository(db).get(created.client_po_id)
+            if cpo and cpo.status == "DRAFT":
+                cpo.status = "ACTIVE"
+                db.flush()
+
         db.commit()
+
+        # Refresh alerts for the linked document
+        try:
+            from app.models import Document
+            doc = db.query(Document).filter(Document.id == created.document_id).first()
+            if doc:
+                AlertGenerator(db).generate_alerts_for_document(doc)
+                db.commit()
+        except Exception:
+            db.rollback()
+
         return created
     except Exception as e:
         db.rollback()

@@ -3,6 +3,7 @@ from sqlalchemy import func, and_, extract
 from app.models import Document, Exception, Alert
 from app.schemas import DocumentCreate, DocumentUpdate, DashboardInsights, KPIMetric, UtilizationTrend, CategorySplit
 from app.services.document_linking_service import DocumentLinkingService
+from app.utils.msa import normalize_msa_number
 import re
 from typing import List, Optional, Dict, Any, Tuple
 import uuid
@@ -25,7 +26,7 @@ class DocumentService:
             id=str(uuid.uuid4()),
             **{**document.dict(), "category": normalized_category}
         )
-        db_document.msa_number = self._normalize_msa_value(document.msa_number)
+        db_document.msa_number = normalize_msa_number(document.msa_number)
         self.db.add(db_document)
         self.db.commit()
         self.db.refresh(db_document)
@@ -43,7 +44,7 @@ class DocumentService:
         now = datetime.utcnow()
 
         for doc in documents:
-            normalized_stored = self._normalize_msa_value(doc.msa_number)
+            normalized_stored = normalize_msa_number(doc.msa_number)
             if normalized_stored and normalized_stored != doc.msa_number:
                 doc.msa_number = normalized_stored
                 msa_key = normalized_stored
@@ -77,7 +78,7 @@ class DocumentService:
 
         for doc in documents:
             msa_key = doc.msa_number or self._resolve_msa_number(doc)
-            msa_key = self._normalize_msa_value(msa_key)
+            msa_key = normalize_msa_number(msa_key)
             if not msa_key:
                 continue
 
@@ -134,8 +135,6 @@ class DocumentService:
 
         return {"buckets": list(buckets.values()), "unlinked_documents": unlinked_documents}
 
-    MSA_PATTERN = re.compile(r"(MSA[\s#:\-]*\d{3,}(?:[-/]\d{2,})?)", re.IGNORECASE)
-
     def generate_unlinked_alerts(self) -> List[Dict[str, Any]]:
         unlinked_documents = self.get_unlinked_documents()
         alerts = []
@@ -151,24 +150,6 @@ class DocumentService:
                 "document_id": doc.id
             })
         return alerts
-
-    def _normalize_msa_value(self, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        cleaned = value.strip().upper().replace(" ", "").replace("_", "-")
-        # Extract canonical substring like MSA-2025-001
-        match = self.MSA_PATTERN.search(cleaned)
-        if not match:
-            generic = re.search(r"(\d{4}[-/]\d{3,})", cleaned)
-            if generic:
-                cleaned = generic.group(1)
-            else:
-                return None
-        else:
-            cleaned = match.group(1)
-        if not cleaned.startswith("MSA"):
-            cleaned = f"MSA-{cleaned}"
-        return cleaned
 
     def _resolve_msa_number(self, document: Document) -> Optional[str]:
         """
@@ -188,7 +169,7 @@ class DocumentService:
         for candidate in candidates:
             if not candidate:
                 continue
-            normalized = self._normalize_msa_value(str(candidate))
+            normalized = normalize_msa_number(str(candidate))
             if normalized:
                 return normalized
 

@@ -309,19 +309,6 @@ class AlertGenerator:
         
         return alerts
     
-    def _calculate_po_utilization(self, po_id: str) -> float:
-        """
-        Calculate total amount of invoices linked to a PO.
-        Returns the sum of all invoice amounts.
-        (Deprecated - use DocumentLinkingService.calculate_po_consumption instead)
-        """
-        po = self.db.query(Document).filter(Document.id == po_id).first()
-        if not po:
-            return 0.0
-        
-        consumption = self.linking_service.calculate_po_consumption(po)
-        return consumption["total_invoiced"]
-    
     def refresh_all_alerts(self) -> int:
         """
         Refresh alerts for all documents.

@@ -8,7 +8,7 @@ Provides sophisticated linking between:
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 from app.models import Document
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta
 import re
 
@@ -200,7 +200,7 @@ class DocumentLinkingService:
             "linked_invoice_count": len(linked_invoices)
         }
     
-    def validate_invoice_against_po(self, invoice: Document, po: Document) -> Dict[str, any]:
+    def validate_invoice_against_po(self, invoice: Document, po: Document) -> Dict[str, Any]:
         """
         Validate an invoice against its linked PO.
         Returns a dict with validation results and issues found.
@@ -258,7 +258,7 @@ class DocumentLinkingService:
             "po_utilization": consumption["utilization_percentage"]
         }
     
-    def check_contract_validity_for_document(self, document: Document, contract: Document) -> Dict[str, any]:
+    def check_contract_validity_for_document(self, document: Document, contract: Document) -> Dict[str, Any]:
         """
         Check if a document (PO or invoice) falls within a contract's validity period.
         Returns validation results.

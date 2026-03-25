@@ -11,6 +11,7 @@ from app.config import settings
 from app.schemas import UploadedFile, UploadResponse, DocumentCreate
 from app.services.pdf_processor import PDFProcessor
 from app.services.alert_generator import AlertGenerator
+from app.utils.msa import normalize_msa_number
 
 class UploadService:
     # Class-level set to track files currently being processed (shared across instances)
@@ -62,24 +63,6 @@ class UploadService:
                 # Fallback to UUID if we can't find a unique name
                 return f"{name}_{uuid.uuid4().hex[:8]}{ext}"
     
-    MSA_PATTERN = re.compile(r"(MSA[\s#:\-]*\d{3,}(?:[-/]\d{2,})?)", re.IGNORECASE)
-
-    def _normalize_msa_number(self, value: str | None) -> str | None:
-        if not value:
-            return None
-        cleaned = value.strip().upper().replace(" ", "").replace("_", "-")
-        match = self.MSA_PATTERN.search(cleaned)
-        if not match:
-            generic = re.search(r"(\d{4}[-/]\d{3,})", cleaned)
-            if generic:
-                cleaned = generic.group(1)
-            else:
-                return None
-        else:
-            cleaned = match.group(1)
-        if not cleaned.startswith("MSA"):
-            cleaned = f"MSA-{cleaned}"
-        return cleaned
 
     async def upload_files(self, files: List[UploadFile]) -> UploadResponse:
         uploads = []
@@ -179,7 +162,6 @@ class UploadService:
                 "error": error_msg,
                 "error_type": "file_not_found"
             }
-            return {"success": False, "error": "File not found"}
         
         # Check if it's a PDF
         if not filename.lower().endswith('.pdf'):
@@ -292,24 +274,48 @@ class UploadService:
                         document = self._save_to_database(result, filename, db)
                         if document:
                             # Run financial classification (creates ClientPO/VendorPO/Invoice record)
+                            financial_record = None
                             try:
                                 from app.services.financial_classification_service import FinancialClassificationService
+                                from app.services.invoice_matching_service import InvoiceMatchingService
+                                from app.services.billing_validation_service import BillingValidationService
                                 fin_svc = FinancialClassificationService(db)
-                                fin_svc.classify_and_create(document, extracted_data)
+                                financial_record = fin_svc.classify_and_create(document, extracted_data)
                                 db.commit()
                             except Exception as fin_err:
                                 print(f"⚠️  Financial classification failed for {filename}: {fin_err}")
                                 db.rollback()
 
-                            # Generate alerts for the new document
-                            alert_generator = AlertGenerator(db)
-                            alerts = alert_generator.generate_alerts_for_document(document)
-                            db.commit()
-                            result["alerts_generated"] = len(alerts)
+                            # Run matching + billing validation for vendor invoices
+                            if financial_record and document.category == "Vendor Invoice":
+                                try:
+                                    from app.models import VendorInvoice as VendorInvoiceModel
+                                    if isinstance(financial_record, VendorInvoiceModel):
+                                        matching_svc = InvoiceMatchingService(db)
+                                        matching_svc.run_full_validation(financial_record)
+                                        if financial_record.vendor_po_id:
+                                            BillingValidationService(db).check_vendor_po_overbilling(
+                                                financial_record.vendor_po_id
+                                            )
+                                        db.commit()
+                                except Exception as match_err:
+                                    print(f"⚠️  Invoice matching/billing check failed for {filename}: {match_err}")
+                                    db.rollback()
+
+                            # Generate alerts for the new document (isolated — never rolls back earlier commits)
+                            try:
+                                alert_generator = AlertGenerator(db)
+                                alerts = alert_generator.generate_alerts_for_document(document)
+                                db.commit()
+                                result["alerts_generated"] = len(alerts)
+                            except Exception as alert_err:
+                                print(f"⚠️  Alert generation failed for {filename}: {alert_err}")
+                                db.rollback()
+                                result["alerts_generated"] = 0
+
                             result["document_db_id"] = document.id
                     except Exception as e:
-                        print(f"Error saving to database or generating alerts: {e}")
-                        # Don't fail the whole process if DB save fails
+                        print(f"Error saving to database: {e}")
                         if db:
                             db.rollback()
             
@@ -356,7 +362,7 @@ class UploadService:
             or filename
         )
 
-        normalized_msa = self._normalize_msa_number(extracted_data.get("msa_number"))
+        normalized_msa = normalize_msa_number(extracted_data.get("msa_number"))
 
         document_create = DocumentCreate(
             title=document_title,
@@ -381,7 +387,7 @@ class UploadService:
         
         if existing_doc:
             updated = False
-            normalized_msa = self._normalize_msa_number(extracted_data.get("msa_number"))
+            normalized_msa = normalize_msa_number(extracted_data.get("msa_number"))
             if normalized_msa and existing_doc.msa_number != normalized_msa:
                 existing_doc.msa_number = normalized_msa
                 updated = True
@@ -399,6 +405,10 @@ class UploadService:
             id=document_id,
             **document_create.dict()
         )
+        # EXTRACTED  — raw OCR text came back from Textract
+        # CLASSIFIED — document type was identified
+        # PARSED     — structured fields were extracted from text
+        # (VALIDATED / FAILED are set later by FinancialClassificationService)
         db_document.processing_status = "PARSED"
         db_document.extracted_json = json.dumps(extracted_data, default=str)
         db.add(db_document)

@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     # Database
     # database_url: str = "sqlite:///./dms_database.db"
     # postgresql
-    # database_url: str = "postgresql://postgres:admin@127.0.0.1:5432/ebmdb"
+    database_url: str = "postgresql://postgres:admin@127.0.0.1:5432/ebmdb"
     
     # Security - MUST be set in .env file
     secret_key: str = ""  # Required: Set SECRET_KEY in .env

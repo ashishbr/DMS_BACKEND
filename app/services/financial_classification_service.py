@@ -77,15 +77,18 @@ class FinancialClassificationService:
             else:
                 # Service Agreement and Unknown — no financial record needed here
                 document.processing_status = ProcessingStatus.VALIDATED
+                document.processed = True
                 self.db.flush()
                 return None
 
             document.processing_status = ProcessingStatus.VALIDATED
+            document.processed = True
             self.db.flush()
             return record
 
         except Exception as exc:
             document.processing_status = ProcessingStatus.FAILED
+            document.processed = False
             try:
                 self.db.flush()
             except Exception:
@@ -187,7 +190,16 @@ class FinancialClassificationService:
             due_date=self._parse_date(data.get("due_date")),
             status="PENDING",
         )
-        return self.client_inv_repo.create(invoice)
+        created = self.client_inv_repo.create(invoice)
+
+        # Auto-advance ClientPO to ACTIVE on first linked invoice
+        if client_po_id:
+            cpo = self.client_po_repo.get(client_po_id)
+            if cpo and cpo.status == "DRAFT":
+                cpo.status = "ACTIVE"
+                self.db.flush()
+
+        return created
 
     def _create_vendor_invoice(
         self, document: Document, data: Dict[str, Any]
@@ -222,9 +234,16 @@ class FinancialClassificationService:
             unit_rate=unit_rate,
             quantity=quantity,
             status="PENDING",
-            matching_status="UNMATCHED" if not vendor_po_id else None,
+            matching_status="TWO_WAY_MATCHED" if vendor_po_id else "UNMATCHED",
         )
         created = self.vendor_inv_repo.create(invoice)
+
+        # Auto-advance VendorPO to ACTIVE on first linked invoice
+        if vendor_po_id:
+            vpo = self.vendor_po_repo.get(vendor_po_id)
+            if vpo and vpo.status == "DRAFT":
+                vpo.status = "ACTIVE"
+                self.db.flush()
 
         # Run matching + overbilling in the same transaction (deferred to services)
         # The services are called from UploadService after this method returns.
