@@ -557,3 +557,90 @@ class ClientWithVendors(BaseModel):
 class ClientsOverviewResponse(BaseModel):
     clients: List[ClientWithVendors]
     total_clients: int
+
+
+# ---------------------------------------------------------------------------
+# Vendor PO Generator — standalone generated POs with PDF
+# ---------------------------------------------------------------------------
+
+class VendorPOItemCreate(BaseModel):
+    description: str
+    quantity: float
+    unit_price: float
+    total: Optional[float] = None  # auto-computed as quantity * unit_price if omitted
+
+
+class VendorPOItemResponse(BaseModel):
+    id: str
+    vendor_po_id: str
+    description: str
+    quantity: float
+    unit_price: float
+    total_price: float
+
+    class Config:
+        from_attributes = True
+
+
+class GeneratedVendorPOCreate(BaseModel):
+    vendor_name: str
+    vendor_address: Optional[str] = None
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    client_name: Optional[str] = None     # client this PO is generated under
+    po_number: Optional[str] = None       # auto-generated if omitted
+    issue_date: Optional[datetime] = None
+    delivery_date: Optional[datetime] = None
+    payment_terms: Optional[str] = None
+    line_items: List[VendorPOItemCreate]
+    subtotal: Optional[float] = None      # computed from items if omitted
+    tax: float = 0.0
+    discount: float = 0.0
+    total_amount: Optional[float] = None  # computed if omitted
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class GeneratedVendorPOUpdate(BaseModel):
+    vendor_name: Optional[str] = None
+    vendor_address: Optional[str] = None
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    client_name: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    payment_terms: Optional[str] = None
+    line_items: Optional[List[VendorPOItemCreate]] = None
+    subtotal: Optional[float] = None
+    tax: Optional[float] = None
+    discount: Optional[float] = None
+    total_amount: Optional[float] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+
+class GeneratedVendorPOResponse(BaseModel):
+    id: str
+    po_number: str
+    vendor_name: str
+    vendor_address: Optional[str] = None
+    vendor_email: Optional[str] = None
+    vendor_phone: Optional[str] = None
+    client_name: Optional[str] = None
+    vendor_po_id: Optional[str] = None   # ID of the linked VendorPO in the financial layer
+    issue_date: Optional[datetime] = None
+    delivery_date: Optional[datetime] = None
+    payment_terms: Optional[str] = None
+    subtotal: float
+    tax: float
+    discount: float
+    total_amount: float
+    notes: Optional[str] = None
+    pdf_path: Optional[str] = None
+    status: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    items: List[VendorPOItemResponse] = []
+
+    class Config:
+        from_attributes = True

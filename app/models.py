@@ -135,7 +135,8 @@ class VendorPO(Base):
     __tablename__ = "vendor_pos"
 
     id = Column(String, primary_key=True, index=True)
-    document_id = Column(String, ForeignKey("documents.id"), nullable=False, unique=True)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=True, unique=True)
+    # nullable=True: manually generated POs have no uploaded document
     vendor_po_number = Column(String, nullable=False, index=True)
     vendor_name = Column(String, nullable=False, index=True)
     client_po_id = Column(String, ForeignKey("client_pos.id"), nullable=True, index=True)
@@ -146,6 +147,7 @@ class VendorPO(Base):
     start_date = Column(DateTime(timezone=True), nullable=True)
     end_date = Column(DateTime(timezone=True), nullable=True)
     status = Column(String, default="DRAFT")  # DRAFT | APPROVED | ACTIVE | CLOSED
+    is_generated = Column(Boolean, default=False)  # True = created via PO Generator, not upload
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     document = relationship("Document", foreign_keys=[document_id])
@@ -225,3 +227,56 @@ class ClientInvoice(Base):
 
     document = relationship("Document", foreign_keys=[document_id])
     client_po = relationship("ClientPO", back_populates="client_invoices")
+
+
+# ---------------------------------------------------------------------------
+# Vendor PO Generator  (Standalone — not linked to uploaded documents)
+# ---------------------------------------------------------------------------
+
+class GeneratedVendorPO(Base):
+    """
+    A Vendor PO created manually via the PO Generator API.
+    Standalone — not derived from an uploaded document.
+    Generates a PDF on creation.
+    """
+    __tablename__ = "generated_vendor_pos"
+
+    id = Column(String, primary_key=True, index=True)
+    po_number = Column(String, nullable=False, unique=True, index=True)
+    vendor_name = Column(String, nullable=False, index=True)
+    vendor_address = Column(Text, nullable=True)
+    vendor_email = Column(String, nullable=True)
+    vendor_phone = Column(String, nullable=True)
+    issue_date = Column(DateTime(timezone=True), nullable=True)
+    delivery_date = Column(DateTime(timezone=True), nullable=True)
+    payment_terms = Column(String, nullable=True)
+    subtotal = Column(Float, nullable=False, default=0.0)
+    tax = Column(Float, nullable=False, default=0.0)
+    discount = Column(Float, nullable=False, default=0.0)
+    total_amount = Column(Float, nullable=False, default=0.0)
+    client_name = Column(String, nullable=True, index=True)  # client this PO is generated under
+    # Link to vendor_pos so the financial layer picks it up
+    vendor_po_id = Column(String, ForeignKey("vendor_pos.id"), nullable=True, unique=True)
+    notes = Column(Text, nullable=True)
+    pdf_path = Column(String, nullable=True)
+    status = Column(String, default="DRAFT")  # DRAFT | SENT | APPROVED | ACTIVE | CLOSED
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    items = relationship("GeneratedVendorPOItem", back_populates="vendor_po", cascade="all, delete-orphan")
+    vendor_po = relationship("VendorPO", foreign_keys=[vendor_po_id])
+
+
+class GeneratedVendorPOItem(Base):
+    """Line items for a GeneratedVendorPO."""
+    __tablename__ = "generated_vendor_po_items"
+
+    id = Column(String, primary_key=True, index=True)
+    vendor_po_id = Column(String, ForeignKey("generated_vendor_pos.id"), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    quantity = Column(Float, nullable=False)
+    unit_price = Column(Float, nullable=False)
+    total_price = Column(Float, nullable=False)
+
+    vendor_po = relationship("GeneratedVendorPO", back_populates="items")

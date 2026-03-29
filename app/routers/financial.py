@@ -585,6 +585,8 @@ async def get_clients_overview(db: Session = Depends(get_db)):
             total_clients=len(clients_result),
         )
     except Exception as e:
+        import traceback
+        print(f"❌ clients-overview error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
