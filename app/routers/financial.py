@@ -506,6 +506,27 @@ async def update_client_invoice(
 
 
 # ---------------------------------------------------------------------------
+# RELINK  (re-run all document matching on existing records)
+# ---------------------------------------------------------------------------
+
+@router.post("/relink")
+async def relink_documents(db: Session = Depends(get_db)):
+    """
+    Re-runs document linking and status advancement on all existing records.
+    Use this after bulk uploads where documents were processed out of order.
+    """
+    try:
+        from app.services.relink_service import RelinkService
+        stats = RelinkService(db).run_full_relink()
+        return {"success": True, "stats": stats}
+    except Exception as e:
+        import traceback
+        db.rollback()
+        print(f"❌ relink error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # CLIENTS OVERVIEW  (hierarchical: client → vendors → invoices)
 # ---------------------------------------------------------------------------
 

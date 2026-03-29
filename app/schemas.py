@@ -300,7 +300,7 @@ class VendorPOUpdate(BaseModel):
 
 class VendorPOResponse(BaseModel):
     id: str
-    document_id: str
+    document_id: Optional[str] = None  # nullable: generated POs have no source document
     vendor_po_number: str
     vendor_name: str
     client_po_id: Optional[str] = None
@@ -311,6 +311,7 @@ class VendorPOResponse(BaseModel):
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     status: str
+    is_generated: bool = False
     created_at: datetime
 
     class Config:

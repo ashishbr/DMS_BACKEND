@@ -17,7 +17,7 @@ When overbilling is detected:
 """
 import uuid
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.models import VendorInvoice, VendorPO, Alert
@@ -92,7 +92,8 @@ class BillingValidationService:
         running = 0.0
         crossed = False
 
-        for inv in sorted(invoices, key=lambda x: x.created_at):
+        _epoch = datetime(1970, 1, 1)
+        for inv in sorted(invoices, key=lambda x: x.created_at or _epoch):
             running += inv.invoice_amount
             if running > cap:
                 excess = running - cap
@@ -113,12 +114,12 @@ class BillingValidationService:
         cap: float,
     ) -> None:
         """Create a critical Alert for overbilling. Idempotent — skips if one exists."""
+        # Use vendor_po_number in title for idempotency (document_id may be NULL for generated POs)
         existing = (
             self.db.query(Alert)
             .filter(
-                Alert.document_id == vendor_po.document_id,
+                Alert.title == f"Vendor PO Overbilling: {vendor_po.vendor_po_number}",
                 Alert.level == "critical",
-                Alert.title.like("Vendor PO Overbilling%"),
                 Alert.acknowledged == False,
             )
             .first()

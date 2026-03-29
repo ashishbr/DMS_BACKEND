@@ -198,13 +198,26 @@ class PDFProcessor:
                 print(f"⚠️  Bedrock extraction failed ({bedrock_err}), falling back to regex extraction")
                 extracted_data = self._extract_structured_data(text_content, document_type, "")
 
-            # Force document type based on extracted identifiers
-            if extracted_data.get("invoice_number"):
-                document_type = "Client Invoice"
-            elif extracted_data.get("po_number"):
-                document_type = "Client PO"
-            elif extracted_data.get("msa_number"):
-                document_type = "Service Agreement"
+            # Refine document type from extracted identifiers ONLY when classification is ambiguous.
+            # Never downgrade a specific vendor/client type to a generic one.
+            _specific_types = {"Client PO", "Vendor PO", "Client Invoice", "Vendor Invoice", "Service Agreement"}
+            if document_type not in _specific_types:
+                # Fall back to identifier-based heuristic when classifier returned Unknown
+                if extracted_data.get("invoice_number"):
+                    # Use vendor keyword in text to disambiguate
+                    _is_vendor_doc = any(
+                        w in text_content.lower()
+                        for w in ["vendor:", "supplier:", "vendor name", "invoice from"]
+                    )
+                    document_type = "Vendor Invoice" if _is_vendor_doc else "Client Invoice"
+                elif extracted_data.get("po_number"):
+                    _is_vendor_doc = any(
+                        w in text_content.lower()
+                        for w in ["vendor:", "supplier:", "vendor name", "order to"]
+                    )
+                    document_type = "Vendor PO" if _is_vendor_doc else "Client PO"
+                elif extracted_data.get("msa_number"):
+                    document_type = "Service Agreement"
             
             # Calculate confidence score
             confidence = self._calculate_confidence(text_content, document_type)
@@ -548,27 +561,47 @@ class PDFProcessor:
         return ' | '.join(text_parts)
     
     def _classify_document(self, text: str) -> str:
-        """Classify document type using keyword matching"""
+        """Classify document type using keyword matching with vendor/client disambiguation."""
         text_lower = text.lower()
-        
-        # Define keywords for each document type
-        type_keywords = {
-            "Client PO": ["purchase order", "client", "po", "order from"],
-            "Vendor PO": ["purchase order", "vendor", "supplier", "order to"],
-            "Client Invoice": ["invoice", "client", "bill to", "invoice to"],
-            "Vendor Invoice": ["invoice", "vendor", "supplier", "invoice from"],
-            "Service Agreement": ["master service agreement", "msa", "service agreement", "agreement", "contract", "scope summary", "expiration date"]
+
+        # Strong discriminating signals — checked first, highest priority
+        strong_signals = {
+            "Vendor Invoice": ["vendor invoice", "invoice from vendor", "supplier invoice"],
+            "Client Invoice": ["client invoice", "invoice to client", "bill to client"],
+            "Vendor PO": ["vendor purchase order", "vendor po", "purchase order to vendor",
+                          "order to supplier", "purchase order\nvendor"],
+            "Client PO": ["client purchase order", "client po", "purchase order from client",
+                          "order from client"],
+            "Service Agreement": ["master service agreement", "msa", "service agreement",
+                                  "scope summary", "expiration date"],
         }
-        
-        scores = {}
-        for doc_type, keywords in type_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            scores[doc_type] = score
-        
-        # Return the type with highest score, or "Unknown" if no match
-        if scores and max(scores.values()) > 0:
-            return max(scores, key=scores.get)
-        
+        for doc_type, signals in strong_signals.items():
+            if any(sig in text_lower for sig in signals):
+                return doc_type
+
+        # Heading / title line classification (first 300 chars usually has the document title)
+        header = text_lower[:300]
+        if "vendor invoice" in header:
+            return "Vendor Invoice"
+        if "client invoice" in header or ("invoice" in header and "vendor" not in header):
+            return "Client Invoice"
+        if "vendor purchase order" in header or ("purchase order" in header and "vendor" in header):
+            return "Vendor PO"
+        if "purchase order" in header:
+            return "Client PO"
+
+        # Fallback: weighted scoring — vendor-specific vs client-specific words
+        is_vendor = any(w in text_lower for w in ["vendor:", "supplier:", "vendor name", "supplier name"])
+        is_invoice = any(w in text_lower for w in ["invoice number", "invoice #", "invoice date", "invoice amount"])
+        is_po = any(w in text_lower for w in ["po number", "purchase order number", "po #", "allocated value"])
+
+        if is_invoice:
+            return "Vendor Invoice" if is_vendor else "Client Invoice"
+        if is_po:
+            return "Vendor PO" if is_vendor else "Client PO"
+        if any(w in text_lower for w in ["msa", "agreement", "contract"]):
+            return "Service Agreement"
+
         return "Unknown"
     
     def _extract_structured_data_bedrock(self, text: str, document_type: str) -> Dict:
@@ -655,6 +688,29 @@ class PDFProcessor:
         fname_lower = filename.lower()
         if "msa" in fname_lower or "agreement" in fname_lower or "contract" in fname_lower:
             return "Service Agreement"
+        # Check combined patterns first (most specific → least specific)
+        if "vendor_invoice" in fname_lower or "vendor_inv" in fname_lower:
+            return "Vendor Invoice"
+        if "client_invoice" in fname_lower or "client_inv" in fname_lower:
+            return "Client Invoice"
+        if "vendor_po" in fname_lower or "vendor_purchase" in fname_lower:
+            return "Vendor PO"
+        if "client_po" in fname_lower or "client_purchase" in fname_lower:
+            return "Client PO"
+        # Short-code patterns: vinv / cinv / vpo / cpo
+        if "vinv" in fname_lower:
+            return "Vendor Invoice"
+        if "cinv" in fname_lower:
+            return "Client Invoice"
+        if "vpo" in fname_lower:
+            return "Vendor PO"
+        if "cpo" in fname_lower:
+            return "Client PO"
+        # Generic patterns: must check "vendor" presence before falling back
+        if "vendor" in fname_lower and ("invoice" in fname_lower or "inv" in fname_lower):
+            return "Vendor Invoice"
+        if "vendor" in fname_lower and ("po" in fname_lower or "purchase" in fname_lower):
+            return "Vendor PO"
         if "invoice" in fname_lower or "inv" in fname_lower:
             return "Client Invoice"
         if "po" in fname_lower or "purchase" in fname_lower:

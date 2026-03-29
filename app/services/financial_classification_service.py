@@ -26,6 +26,7 @@ from app.repositories.client_po_repository import ClientPORepository
 from app.repositories.vendor_po_repository import VendorPORepository
 from app.repositories.client_invoice_repository import ClientInvoiceRepository
 from app.repositories.vendor_invoice_repository import VendorInvoiceRepository
+from app.repositories.po_mapping_repository import POMappingRepository
 
 
 # Processing status constants
@@ -45,6 +46,7 @@ class FinancialClassificationService:
         self.vendor_po_repo = VendorPORepository(db)
         self.client_inv_repo = ClientInvoiceRepository(db)
         self.vendor_inv_repo = VendorInvoiceRepository(db)
+        self.mapping_repo = POMappingRepository(db)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -146,21 +148,35 @@ class FinancialClassificationService:
         # Attempt to auto-link to a ClientPO using the MSA number or client match
         client_po_id = self._find_client_po_for_vendor_po(data, document)
 
+        allocated_value = float(data.get("amount") or document.amount or 0.0)
+        currency = data.get("currency") or document.currency or "USD"
+
         vendor_po = VendorPO(
             id=str(uuid.uuid4()),
             document_id=document.id,
             vendor_po_number=vendor_po_number,
             vendor_name=data.get("vendor") or document.vendor or "Unknown Vendor",
             client_po_id=client_po_id,
-            allocated_value=float(data.get("amount") or document.amount or 0.0),
-            currency=data.get("currency") or document.currency or "USD",
+            allocated_value=allocated_value,
+            currency=currency,
             service_description=data.get("summary"),
             issue_date=self._parse_date(data.get("date")),
             start_date=self._parse_date(data.get("date")),
             end_date=self._parse_date(data.get("due_date")),
             status="DRAFT",
         )
-        return self.vendor_po_repo.create(vendor_po)
+        created = self.vendor_po_repo.create(vendor_po)
+
+        # Auto-create POAllocation when a ClientPO link was found
+        if client_po_id:
+            self.mapping_repo.upsert(
+                client_po_id=client_po_id,
+                vendor_po_id=created.id,
+                allocated_value=allocated_value,
+                currency=currency,
+            )
+
+        return created
 
     def _create_client_invoice(
         self, document: Document, data: Dict[str, Any]

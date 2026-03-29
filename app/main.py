@@ -1,11 +1,13 @@
 import json
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from apscheduler.schedulers.background import BackgroundScheduler
 from app.config import settings
-from app.database import engine
+from app.database import engine, SessionLocal
 from app.models import Base
 from app.routers import dashboard, documents, exceptions, alerts, chat, uploads, processed_documents, financial
 from app.routers import vendor_po as vendor_po_router
@@ -13,11 +15,40 @@ from app.routers import vendor_po as vendor_po_router
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+
+def _run_relink():
+    """Scheduled job: re-link documents and advance statuses every hour."""
+    db = SessionLocal()
+    try:
+        from app.services.relink_service import RelinkService
+        stats = RelinkService(db).run_full_relink()
+        print(f"[scheduler] relink completed: {stats}")
+    except Exception as exc:
+        print(f"[scheduler] relink failed: {exc}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(_run_relink, "interval", minutes=1, id="relink_job")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start()
+    print("[scheduler] relink job started — runs every 5 minutes")
+    yield
+    scheduler.shutdown(wait=False)
+    print("[scheduler] stopped")
+
+
 # Create FastAPI app
 app = FastAPI(
     title="DMS Dashboard API",
     description="Document Management System API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Log full Pydantic validation errors so 422s are debuggable in the terminal

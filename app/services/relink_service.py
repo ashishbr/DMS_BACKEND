@@ -1,0 +1,326 @@
+"""
+RelinkService
+-------------
+Re-runs all document linking and status advancement on already-processed records.
+
+Use this when:
+  - Multiple documents were uploaded at once (wrong processing order)
+  - Auto-linking failed during initial classification
+  - POAllocation entries are missing for linked VendorPOs
+  - Statuses are stuck at DRAFT despite linked invoices existing
+
+Endpoint: POST /api/financial/relink
+"""
+import uuid
+from typing import Dict, Any
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from app.models import (
+    Document,
+    ClientPO,
+    VendorPO,
+    VendorInvoice,
+    ClientInvoice,
+    POAllocation,
+)
+from app.repositories.client_po_repository import ClientPORepository
+from app.repositories.vendor_po_repository import VendorPORepository
+from app.repositories.po_mapping_repository import POMappingRepository
+from app.repositories.vendor_invoice_repository import VendorInvoiceRepository
+from app.repositories.client_invoice_repository import ClientInvoiceRepository
+
+
+class RelinkService:
+    def __init__(self, db: Session):
+        self.db = db
+        self.client_po_repo = ClientPORepository(db)
+        self.vendor_po_repo = VendorPORepository(db)
+        self.mapping_repo = POMappingRepository(db)
+        self.vendor_inv_repo = VendorInvoiceRepository(db)
+        self.client_inv_repo = ClientInvoiceRepository(db)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def run_full_relink(self) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "vendor_pos_linked": 0,
+            "allocations_created": 0,
+            "vendor_invoices_linked": 0,
+            "client_invoices_linked": 0,
+            "statuses_advanced": 0,
+        }
+
+        stats["vendor_pos_linked"] = self._link_vendor_pos_to_client_pos()
+        stats["allocations_created"] = self._create_missing_allocations()
+        stats["vendor_invoices_linked"] = self._link_vendor_invoices_to_pos()
+        stats["client_invoices_linked"] = self._link_client_invoices_to_pos()
+        stats["statuses_advanced"] = self._advance_statuses()
+
+        self.db.commit()
+        return stats
+
+    # ------------------------------------------------------------------
+    # Step 1: Link unlinked VendorPOs → ClientPOs
+    # ------------------------------------------------------------------
+
+    def _link_vendor_pos_to_client_pos(self) -> int:
+        """
+        For each VendorPO with no client_po_id, try to find its ClientPO via:
+        1. The linked Document's client name → exact ClientPO match
+        2. VendorPO.vendor_po_number contains a CPO reference (e.g. "CPO-2024-001")
+        """
+        unlinked = (
+            self.db.query(VendorPO)
+            .filter(VendorPO.client_po_id.is_(None), VendorPO.is_generated == False)
+            .all()
+        )
+        linked = 0
+        for vpo in unlinked:
+            client_name = self._get_client_name_for_vendor_po(vpo)
+            if not client_name:
+                continue
+
+            candidates = self.client_po_repo.get_by_client_name(client_name)
+            if not candidates:
+                continue
+
+            # Prefer unique match; if multiple POs for same client, pick the ACTIVE/latest one
+            cpo = (
+                candidates[0]
+                if len(candidates) == 1
+                else self._pick_best_client_po(candidates)
+            )
+            if cpo:
+                vpo.client_po_id = cpo.id
+                self.db.flush()
+                linked += 1
+
+        return linked
+
+    def _get_client_name_for_vendor_po(self, vpo: VendorPO) -> str:
+        """Resolve client name from the linked Document row (if any)."""
+        if vpo.document_id:
+            doc = self.db.query(Document).filter(Document.id == vpo.document_id).first()
+            if doc and doc.client and doc.client != "Unknown Client":
+                return doc.client
+        return ""
+
+    def _pick_best_client_po(self, candidates):
+        # Prefer ACTIVE, then DRAFT with most recent created_at
+        _epoch = datetime(1970, 1, 1)
+        active = [c for c in candidates if c.status == "ACTIVE"]
+        if active:
+            return sorted(active, key=lambda c: c.created_at or _epoch, reverse=True)[0]
+        return sorted(candidates, key=lambda c: c.created_at or _epoch, reverse=True)[0]
+
+    # ------------------------------------------------------------------
+    # Step 2: Create missing POAllocation rows
+    # ------------------------------------------------------------------
+
+    def _create_missing_allocations(self) -> int:
+        """
+        For every VendorPO that has a client_po_id but no POAllocation entry,
+        create the allocation record.
+        """
+        linked_vpos = (
+            self.db.query(VendorPO)
+            .filter(VendorPO.client_po_id.isnot(None))
+            .all()
+        )
+        created = 0
+        for vpo in linked_vpos:
+            existing = self.mapping_repo.get_by_vendor_po(vpo.id)
+            if not existing:
+                self.mapping_repo.upsert(
+                    client_po_id=vpo.client_po_id,
+                    vendor_po_id=vpo.id,
+                    allocated_value=vpo.allocated_value,
+                    currency=vpo.currency or "USD",
+                )
+                created += 1
+        return created
+
+    # ------------------------------------------------------------------
+    # Step 3: Link unlinked VendorInvoices → VendorPOs
+    # ------------------------------------------------------------------
+
+    def _link_vendor_invoices_to_pos(self) -> int:
+        """
+        For each VendorInvoice with no vendor_po_id, try to find its VendorPO via:
+        1. invoice.vendor_name fuzzy-match on VendorPO.vendor_name (unique)
+        2. po_number stored in the linked Document's extracted_json
+        """
+        unlinked = (
+            self.db.query(VendorInvoice)
+            .filter(VendorInvoice.vendor_po_id.is_(None))
+            .all()
+        )
+        linked = 0
+        for inv in unlinked:
+            vpo = self._find_vendor_po_for_invoice(inv)
+            if vpo:
+                inv.vendor_po_id = vpo.id
+                inv.matching_status = "TWO_WAY_MATCHED"
+                self.db.flush()
+                linked += 1
+            else:
+                inv.matching_status = "UNMATCHED"
+                self.db.flush()
+
+        return linked
+
+    def _find_vendor_po_for_invoice(self, inv: VendorInvoice):
+        # 1. Try po_number stored in the source document's extracted JSON
+        po_num = self._get_po_number_from_document(inv.document_id)
+        if po_num:
+            vpo = self.vendor_po_repo.get_by_vendor_po_number(po_num)
+            if vpo:
+                return vpo
+
+        # 2. Fuzzy vendor name match (unique = safe to auto-link)
+        candidates = self.vendor_po_repo.find_by_vendor_name_fuzzy(
+            inv.vendor_name, limit=10
+        )
+        same_currency = [c for c in candidates if c.currency == inv.currency]
+        if len(same_currency) == 1:
+            return same_currency[0]
+
+        # 3. Exact vendor name (case-insensitive) — pick most recent
+        exact = [
+            c for c in same_currency
+            if c.vendor_name.lower() == inv.vendor_name.lower()
+        ]
+        if exact:
+            return sorted(exact, key=lambda v: v.issue_date or datetime(1970, 1, 1), reverse=True)[0]
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Step 4: Link unlinked ClientInvoices → ClientPOs
+    # ------------------------------------------------------------------
+
+    def _link_client_invoices_to_pos(self) -> int:
+        """
+        For each ClientInvoice with no client_po_id, find its ClientPO via:
+        1. po_number in the source Document's extracted JSON
+        2. client_name → ClientPO.client_name (unique match)
+        """
+        unlinked = (
+            self.db.query(ClientInvoice)
+            .filter(ClientInvoice.client_po_id.is_(None))
+            .all()
+        )
+        linked = 0
+        for inv in unlinked:
+            cpo = self._find_client_po_for_invoice(inv)
+            if cpo:
+                inv.client_po_id = cpo.id
+                self.db.flush()
+                linked += 1
+
+        return linked
+
+    def _find_client_po_for_invoice(self, inv: ClientInvoice):
+        # 1. PO number from source document
+        po_num = self._get_po_number_from_document(inv.document_id)
+        if po_num:
+            cpo = self.client_po_repo.get_by_po_number(po_num)
+            if cpo:
+                return cpo
+
+        # 2. Client name match
+        if inv.client_name:
+            candidates = self.client_po_repo.get_by_client_name(inv.client_name)
+            if len(candidates) == 1:
+                return candidates[0]
+            if candidates:
+                return self._pick_best_client_po(candidates)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Step 5: Advance statuses
+    # ------------------------------------------------------------------
+
+    def _advance_statuses(self) -> int:
+        """
+        Advance ClientPO and VendorPO from DRAFT → ACTIVE when they
+        have at least one linked invoice.
+        """
+        advanced = 0
+
+        # VendorPOs: DRAFT → ACTIVE when at least one linked VendorInvoice exists
+        draft_vpos = (
+            self.db.query(VendorPO)
+            .filter(VendorPO.status == "DRAFT")
+            .all()
+        )
+        for vpo in draft_vpos:
+            has_invoice = (
+                self.db.query(VendorInvoice)
+                .filter(VendorInvoice.vendor_po_id == vpo.id)
+                .first()
+            )
+            if has_invoice:
+                vpo.status = "ACTIVE"
+                self.db.flush()
+                advanced += 1
+
+        # ClientPOs: DRAFT → ACTIVE when at least one linked ClientInvoice exists
+        draft_cpos = (
+            self.db.query(ClientPO)
+            .filter(ClientPO.status == "DRAFT")
+            .all()
+        )
+        for cpo in draft_cpos:
+            has_invoice = (
+                self.db.query(ClientInvoice)
+                .filter(ClientInvoice.client_po_id == cpo.id)
+                .first()
+            )
+            if has_invoice:
+                cpo.status = "ACTIVE"
+                self.db.flush()
+                advanced += 1
+
+        return advanced
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def _get_po_number_from_document(self, document_id: str) -> str:
+        """
+        Pull po_number from Document.po_number or from extracted_json.
+        Invoices often store the referenced PO number in the source document.
+        """
+        if not document_id:
+            return ""
+
+        doc = self.db.query(Document).filter(Document.id == document_id).first()
+        if not doc:
+            return ""
+
+        # Direct field first
+        if doc.po_number:
+            return doc.po_number
+
+        # Fall back to extracted_json
+        if doc.extracted_json:
+            import json
+            try:
+                data = json.loads(doc.extracted_json)
+                return (
+                    data.get("po_number")
+                    or data.get("reference_po_number")
+                    or data.get("client_po_number")
+                    or ""
+                )
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return ""
