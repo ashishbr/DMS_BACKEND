@@ -184,14 +184,137 @@ class DocumentService:
         ]
     
     def update_document(self, document_id: str, document: DocumentUpdate) -> Optional[Document]:
+        from app.models import ClientPO, ClientInvoice
+
         db_document = self.get_document(document_id)
         if not db_document:
             return None
-        
-        update_data = document.dict(exclude_unset=True)
+
+        update_data = document.model_dump(exclude_unset=True)
+        new_client = update_data.get("client")
+
         for field, value in update_data.items():
             setattr(db_document, field, value)
-        
+
+        # Only cascade a real client name — never cascade a blank/unknown
+        # (unlink clears doc.client but leaves financial records intact
+        #  so the relink service can re-evaluate them later)
+        BLANK_CLIENT_VALUES = {"", "unknown client", "unknown"}
+        if new_client is not None and new_client.strip().lower() not in BLANK_CLIENT_VALUES:
+            client_po = (
+                self.db.query(ClientPO)
+                .filter(ClientPO.document_id == document_id)
+                .first()
+            )
+            if client_po:
+                client_po.client_name = new_client
+                self.db.query(ClientInvoice).filter(
+                    ClientInvoice.client_po_id == client_po.id
+                ).update({"client_name": new_client})
+
+            self.db.query(ClientInvoice).filter(
+                ClientInvoice.document_id == document_id
+            ).update({"client_name": new_client})
+
+        self.db.commit()
+        self.db.refresh(db_document)
+        return db_document
+
+    def update_document_fields(self, document_id: str, document: DocumentUpdate) -> Optional[Document]:
+        """
+        User-correction of extracted fields after processing.
+        Updates the Document row AND the corresponding financial record
+        (ClientPO / VendorPO / ClientInvoice / VendorInvoice) so that
+        linking/matching uses the corrected values on the next relink.
+        """
+        from app.models import ClientPO, VendorPO, ClientInvoice, VendorInvoice
+
+        db_document = self.get_document(document_id)
+        if not db_document:
+            return None
+
+        update_data = document.model_dump(exclude_unset=True)
+        BLANK_CLIENT_VALUES = {"", "unknown client", "unknown"}
+
+        # --- Apply to Document row ---
+        for field, value in update_data.items():
+            setattr(db_document, field, value)
+
+        category = db_document.category
+
+        # --- Cascade to the financial record that owns this document ---
+        if category == "Client PO":
+            cpo = self.db.query(ClientPO).filter(ClientPO.document_id == document_id).first()
+            if cpo:
+                if "po_number" in update_data and update_data["po_number"]:
+                    cpo.po_number = update_data["po_number"]
+                if "client" in update_data:
+                    new_client = update_data["client"]
+                    if new_client and new_client.strip().lower() not in BLANK_CLIENT_VALUES:
+                        cpo.client_name = new_client
+                        # Also cascade to invoices under this PO
+                        self.db.query(ClientInvoice).filter(
+                            ClientInvoice.client_po_id == cpo.id
+                        ).update({"client_name": new_client})
+                if "amount" in update_data and update_data["amount"] is not None:
+                    cpo.total_value = update_data["amount"]
+                if "currency" in update_data and update_data["currency"]:
+                    cpo.currency = update_data["currency"]
+                if "msa_number" in update_data:
+                    cpo.msa_number = update_data["msa_number"]
+
+        elif category == "Vendor PO":
+            vpo = self.db.query(VendorPO).filter(VendorPO.document_id == document_id).first()
+            if vpo:
+                if "po_number" in update_data and update_data["po_number"]:
+                    vpo.vendor_po_number = update_data["po_number"]
+                if "vendor" in update_data and update_data["vendor"]:
+                    vpo.vendor_name = update_data["vendor"]
+                if "amount" in update_data and update_data["amount"] is not None:
+                    vpo.allocated_value = update_data["amount"]
+                if "currency" in update_data and update_data["currency"]:
+                    vpo.currency = update_data["currency"]
+
+        elif category == "Client Invoice":
+            ci = self.db.query(ClientInvoice).filter(ClientInvoice.document_id == document_id).first()
+            if ci:
+                if "invoice_number" in update_data and update_data["invoice_number"]:
+                    ci.invoice_number = update_data["invoice_number"]
+                if "client" in update_data:
+                    new_client = update_data["client"]
+                    if new_client and new_client.strip().lower() not in BLANK_CLIENT_VALUES:
+                        ci.client_name = new_client
+                if "amount" in update_data and update_data["amount"] is not None:
+                    ci.invoice_amount = update_data["amount"]
+                if "currency" in update_data and update_data["currency"]:
+                    ci.currency = update_data["currency"]
+                if "due_date" in update_data:
+                    ci.due_date = update_data["due_date"]
+                # When user explicitly provides a PO number, clear the existing
+                # client_po_id so the relink service re-evaluates using the new
+                # po_number (handles both missing-PO and wrong-auto-link cases).
+                if "po_number" in update_data and update_data["po_number"]:
+                    ci.client_po_id = None
+
+        elif category == "Vendor Invoice":
+            vi = self.db.query(VendorInvoice).filter(VendorInvoice.document_id == document_id).first()
+            if vi:
+                if "invoice_number" in update_data and update_data["invoice_number"]:
+                    vi.invoice_number = update_data["invoice_number"]
+                if "vendor" in update_data and update_data["vendor"]:
+                    vi.vendor_name = update_data["vendor"]
+                if "amount" in update_data and update_data["amount"] is not None:
+                    vi.invoice_amount = update_data["amount"]
+                if "currency" in update_data and update_data["currency"]:
+                    vi.currency = update_data["currency"]
+                if "due_date" in update_data:
+                    vi.due_date = update_data["due_date"]
+                # When user explicitly provides a PO number, clear the existing
+                # vendor_po_id so the relink service re-evaluates using the new
+                # po_number (handles both missing-PO and wrong-auto-link cases).
+                if "po_number" in update_data and update_data["po_number"]:
+                    vi.vendor_po_id = None
+
         self.db.commit()
         self.db.refresh(db_document)
         return db_document

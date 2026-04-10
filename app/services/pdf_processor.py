@@ -166,8 +166,8 @@ class PDFProcessor:
                     "processing_time": datetime.now().isoformat()
                 }
             
-            # Poll for job completion
-            text_content = self._wait_for_textract_job(job_id)
+            # Poll for job completion (non-blocking)
+            text_content = await self._wait_for_textract_job(job_id)
             if not text_content:
                 # Clean up S3 file
                 self._cleanup_s3_file(temp_s3_key)
@@ -254,51 +254,49 @@ class PDFProcessor:
                 "processing_time": datetime.now().isoformat()
             }
     
-    def _wait_for_textract_job(self, job_id: str, max_wait_time: int = 300) -> Optional[str]:
-        """Wait for Textract job to complete and return extracted text"""
+    async def _wait_for_textract_job(self, job_id: str, max_wait_time: int = 300) -> Optional[str]:
+        """Wait for Textract job to complete and return extracted text.
+        Uses asyncio.sleep so the event loop stays free during polling.
+        """
+        import asyncio
         start_time = time.time()
-        
+
         while time.time() - start_time < max_wait_time:
             try:
-                response = self.textract_client.get_document_text_detection(JobId=job_id)
+                response = await asyncio.to_thread(
+                    self.textract_client.get_document_text_detection, JobId=job_id
+                )
                 status = response['JobStatus']
-                
+
                 if status == 'SUCCEEDED':
-                    # Extract text from blocks
                     text_lines = []
-                    next_token = None
-                    
                     while True:
                         for block in response.get('Blocks', []):
                             if block['BlockType'] == 'LINE':
                                 text_lines.append(block.get('Text', ''))
-                        
-                        # Check if there are more pages
                         next_token = response.get('NextToken')
                         if not next_token:
                             break
-                        
-                        response = self.textract_client.get_document_text_detection(
+                        response = await asyncio.to_thread(
+                            self.textract_client.get_document_text_detection,
                             JobId=job_id,
-                            NextToken=next_token
+                            NextToken=next_token,
                         )
-                    
                     return '\n'.join(text_lines)
-                
+
                 elif status == 'FAILED':
                     error_message = response.get('StatusMessage', 'Unknown error')
                     print(f"Textract job failed: {error_message}")
                     return None
-                
+
                 elif status in ['IN_PROGRESS', 'PARTIAL_SUCCESS']:
-                    # Wait before checking again
-                    time.sleep(2)
+                    await asyncio.sleep(2)  # non-blocking wait
                     continue
-                
+
             except ClientError as e:
                 print(f"Error checking Textract job status: {e}")
                 return None
-        
+
         print(f"Textract job timed out after {max_wait_time} seconds")
         return None
     
@@ -345,50 +343,54 @@ class PDFProcessor:
             return None
     
     def _get_existing_processed_data(self, filename: str, s3_key: str = None) -> Optional[Dict]:
-        """Try to retrieve existing processed data for a file from local storage
-        Matches by checking if the processed data references the same S3 location or filename
+        """Try to retrieve existing processed data for a file from local storage.
+        Matches by document_id prefix derived from the filename, or by the
+        stored pdf_url/file_path field — never by filename-in-title (unreliable).
         """
+        import json as _json
         try:
-            # Check if processed JSON file exists
             processed_dir = self.processed_dir
             if not os.path.exists(processed_dir):
                 return None
-            
-            # Look for JSON files that might contain this filename
+
+            # Build a set of reliable match targets from the filename
+            name_stem = os.path.splitext(filename)[0].lower()  # e.g. "po_6000139634"
+            pdf_url_suffix = f"/uploads/{filename}".lower()
+
             for json_file in os.listdir(processed_dir):
-                if json_file.endswith('.json'):
-                    json_path = os.path.join(processed_dir, json_file)
-                    try:
-                        import json
-                        with open(json_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            
-                            # Check if this processed data is for the same file
-                            if not data.get('success', False):
-                                continue
-                            
-                            # Try to match by checking extracted_data for filename patterns
-                            # or by checking if the document was processed from the same S3 location
-                            extracted_data = data.get('extracted_data', {})
-                            
-                            # Check if we can match by filename in the extracted data
-                            # Some documents might have the filename in title or other fields
-                            title = extracted_data.get('title', '').lower()
-                            if filename.lower() in title or title in filename.lower():
-                                return data
-                            
-                            # If S3 key is provided, we could also check metadata
-                            # For now, we'll do a simple check: if the document_id format matches
-                            # the expected pattern for this filename, it might be a match
-                            # But this is not perfect, so we'll be conservative
-                            
-                    except Exception as e:
-                        print(f"Warning: Error reading processed file {json_file}: {e}")
+                if not json_file.endswith('.json'):
+                    continue
+                json_path = os.path.join(processed_dir, json_file)
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        data = _json.load(f)
+
+                    if not data.get('success', False):
                         continue
-            
-            # No matching processed data found
+
+                    # Match 1: document_id contains the filename stem
+                    doc_id = (data.get('document_id') or '').lower()
+                    if name_stem and name_stem in doc_id:
+                        return data
+
+                    # Match 2: stored pdf_url ends with /uploads/<filename>
+                    extracted = data.get('extracted_data', {})
+                    stored_pdf_url = (extracted.get('pdf_url') or '').lower()
+                    if stored_pdf_url and stored_pdf_url.endswith(pdf_url_suffix):
+                        return data
+
+                    # Match 3: S3 key suffix matches filename
+                    if s3_key and filename.lower() in s3_key.lower():
+                        stored_s3 = data.get('s3_key', '')
+                        if stored_s3 and filename.lower() in stored_s3.lower():
+                            return data
+
+                except Exception as e:
+                    print(f"Warning: Error reading processed file {json_file}: {e}")
+                    continue
+
             return None
-            
+
         except Exception as e:
             print(f"Warning: Error getting existing processed data: {e}")
             return None
@@ -615,7 +617,7 @@ class PDFProcessor:
 
     Return ONLY valid JSON with these exact fields (use null if not found):
     {{
-    "title": "string or null",
+    "title": "SHORT document identifier only — use the PO number, invoice number, or document type label (e.g. 'TAX INVOICE', 'Purchase Order'). NEVER put a sentence, clause, or description here. Max 60 characters.",
     "client": "string or null",
     "vendor": "string or null",
     "amount": 0,
@@ -632,7 +634,10 @@ class PDFProcessor:
     "contact_info": {{"emails": [], "phones": [], "addresses": []}}
     }}
 
-    IMPORTANT: key_terms MUST be a JSON array of strings. contact_info MUST be a JSON object.
+    IMPORTANT:
+    - title MUST be a short identifier (PO/invoice number, or document type label like "TAX INVOICE"). Never a sentence.
+    - key_terms MUST be a JSON array of strings.
+    - contact_info MUST be a JSON object.
 
     Document text:
     {text[:8000]}"""
@@ -1580,11 +1585,79 @@ class PDFProcessor:
         
         if phones:
             contact_info['phones'] = phones[:3]
-        
+
         # Addresses (simple pattern)
         address_pattern = r'([A-Za-z\s]+,\s*[A-Za-z\s]+,\s*[A-Z]{2,3})'
         addresses = re.findall(address_pattern, text)
         if addresses:
             contact_info['addresses'] = addresses[:2]
-        
+
         return contact_info
+
+    # ------------------------------------------------------------------
+    # Manual field correction: patch the JSON cache file in-place
+    # ------------------------------------------------------------------
+
+    def update_cache_fields(self, document_id: str, fields: Dict) -> bool:
+        """
+        Patch the extracted_data section of the JSON cache file for a given
+        document_id with user-corrected values.
+
+        Only keys present in `fields` are updated; all other fields are left
+        as-is.  Returns True if the file was found and updated, False otherwise.
+
+        Mapping from DocumentUpdate field names to extracted_data keys:
+          title, client, vendor, amount, currency, po_number,
+          invoice_number, msa_number, due_date
+        """
+        import json as _json
+
+        # Map DocumentUpdate field names → extracted_data JSON keys
+        FIELD_MAP = {
+            "title": "title",
+            "client": "client",
+            "vendor": "vendor",
+            "amount": "amount",
+            "currency": "currency",
+            "po_number": "po_number",
+            "invoice_number": "invoice_number",
+            "msa_number": "msa_number",
+            "due_date": "due_date",
+        }
+
+        if not os.path.exists(self.processed_dir):
+            return False
+
+        # Files are saved as {document_id}.json — target directly, no full-dir scan
+        json_path = os.path.join(self.processed_dir, f"{document_id}.json")
+        if not os.path.exists(json_path):
+            return False
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = _json.load(f)
+
+            # Patch extracted_data
+            extracted = data.setdefault('extracted_data', {})
+            for db_field, json_key in FIELD_MAP.items():
+                if db_field not in fields:
+                    continue
+                value = fields[db_field]
+                if value is not None:
+                    extracted[json_key] = value
+                elif db_field == "due_date":
+                    # Explicitly clear due_date when user sets it to null
+                    extracted.pop(json_key, None)
+
+            # Sync document_type with category if it changed
+            if "category" in fields and fields["category"]:
+                data["document_type"] = fields["category"]
+
+            with open(json_path, 'w', encoding='utf-8') as f:
+                _json.dump(data, f, indent=2, ensure_ascii=False)
+
+            return True
+
+        except Exception as e:
+            print(f"Warning: could not patch cache file {document_id}.json: {e}")
+            return False

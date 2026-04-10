@@ -1,6 +1,6 @@
 """
-Financial Classification Service
----------------------------------
+Financial Classification Service  (fixed)
+------------------------------------------
 Orchestrates the final step of the document ingestion pipeline.
 
 After a document is saved to the `documents` table and classified, this
@@ -27,6 +27,54 @@ from app.repositories.vendor_po_repository import VendorPORepository
 from app.repositories.client_invoice_repository import ClientInvoiceRepository
 from app.repositories.vendor_invoice_repository import VendorInvoiceRepository
 from app.repositories.po_mapping_repository import POMappingRepository
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_JUNK_CLIENT_VALUES = frozenset({
+    "", "n/a", "na", "none", "null", "unknown", "unknown client",
+    "not specified", "not available", "not found", "not applicable",
+    "buyer", "client", "company", "customer",
+})
+
+
+def _normalize_client(value: Optional[str]) -> str:
+    """Return a sanitized client name, falling back to 'Unknown Client'."""
+    if not value:
+        return "Unknown Client"
+    v = value.strip()
+    if v.lower() in _JUNK_CLIENT_VALUES or len(v) < 2:
+        return "Unknown Client"
+    # Reject values that look like sentences (> 6 words with common function words)
+    words = v.split()
+    if len(words) > 6:
+        return "Unknown Client"
+    return v
+
+
+def _normalize_vendor(value: Optional[str]) -> str:
+    """Return a sanitized vendor name, falling back to 'Unknown Vendor'."""
+    if not value:
+        return "Unknown Vendor"
+    v = value.strip()
+    _junk = frozenset({
+        "", "n/a", "na", "none", "null", "unknown", "unknown vendor",
+        "not specified", "not available", "vendor", "supplier",
+    })
+    if v.lower() in _junk or len(v) < 2 or len(v.split()) > 6:
+        return "Unknown Vendor"
+    return v
+
+
+def _pick_best_client_po(candidates):
+    """From a list of ClientPO rows, prefer ACTIVE then most recently created."""
+    from datetime import datetime as _dt
+    _epoch = _dt(1970, 1, 1)
+    active = [c for c in candidates if c.status == "ACTIVE"]
+    pool = active or candidates
+    return sorted(pool, key=lambda c: c.created_at or _epoch, reverse=True)[0]
 
 
 # Processing status constants
@@ -116,17 +164,22 @@ class FinancialClassificationService:
             or f"CPO-{document.id[:8].upper()}"
         )
 
+        # service_scope: prefer summary string; fall back to key_terms joined as text
+        key_terms = data.get("key_terms")
+        key_terms_str = ", ".join(key_terms) if isinstance(key_terms, list) else (key_terms or "")
+        service_scope = data.get("summary") or key_terms_str or None
+
         client_po = ClientPO(
             id=str(uuid.uuid4()),
             document_id=document.id,
             po_number=po_number,
-            client_name=data.get("client") or document.client or "Unknown Client",
+            client_name=_normalize_client(data.get("client") or document.client),
             total_value=float(data.get("amount") or document.amount or 0.0),
             currency=data.get("currency") or document.currency or "USD",
-            service_scope=data.get("summary") or data.get("key_terms"),
+            service_scope=service_scope,
             issue_date=self._parse_date(data.get("date")),
-            start_date=self._parse_date(data.get("date")),
-            end_date=self._parse_date(data.get("due_date")),
+            start_date=self._parse_date(data.get("start_date")),   # distinct from issue_date
+            end_date=self._parse_date(data.get("due_date") or data.get("end_date")),
             status="DRAFT",
             msa_number=data.get("msa_number") or document.msa_number,
         )
@@ -155,14 +208,14 @@ class FinancialClassificationService:
             id=str(uuid.uuid4()),
             document_id=document.id,
             vendor_po_number=vendor_po_number,
-            vendor_name=data.get("vendor") or document.vendor or "Unknown Vendor",
+            vendor_name=_normalize_vendor(data.get("vendor") or document.vendor),
             client_po_id=client_po_id,
             allocated_value=allocated_value,
             currency=currency,
-            service_description=data.get("summary"),
+            service_description=data.get("summary") or None,
             issue_date=self._parse_date(data.get("date")),
-            start_date=self._parse_date(data.get("date")),
-            end_date=self._parse_date(data.get("due_date")),
+            start_date=self._parse_date(data.get("start_date")),   # distinct from issue_date
+            end_date=self._parse_date(data.get("due_date") or data.get("end_date")),
             status="DRAFT",
         )
         created = self.vendor_po_repo.create(vendor_po)
@@ -199,7 +252,7 @@ class FinancialClassificationService:
             document_id=document.id,
             client_po_id=client_po_id,
             invoice_number=invoice_number,
-            client_name=data.get("client") or document.client or "Unknown Client",
+            client_name=_normalize_client(data.get("client") or document.client),
             invoice_amount=float(data.get("amount") or document.amount or 0.0),
             currency=data.get("currency") or document.currency or "USD",
             invoice_date=self._parse_date(data.get("date")),
@@ -242,7 +295,7 @@ class FinancialClassificationService:
             document_id=document.id,
             vendor_po_id=vendor_po_id,
             invoice_number=invoice_number,
-            vendor_name=data.get("vendor") or document.vendor or "Unknown Vendor",
+            vendor_name=_normalize_vendor(data.get("vendor") or document.vendor),
             invoice_amount=float(data.get("amount") or document.amount or 0.0),
             currency=data.get("currency") or document.currency or "USD",
             invoice_date=self._parse_date(data.get("date")),
@@ -280,17 +333,17 @@ class FinancialClassificationService:
             if cpo:
                 return cpo.id
 
-        # 2. By client name + msa_number
+        # 2. By client name + optional msa_number
         msa = data.get("msa_number") or document.msa_number
-        client = data.get("client") or document.client
-        if client:
+        client = _normalize_client(data.get("client") or document.client)
+        if client and client != "Unknown Client":
             candidates = self.client_po_repo.get_by_client_name(client)
             if msa:
-                for cpo in candidates:
-                    if cpo.msa_number and cpo.msa_number == msa:
-                        return cpo.id
-            if len(candidates) == 1:
-                return candidates[0].id
+                msa_match = [c for c in candidates if c.msa_number and c.msa_number == msa]
+                if msa_match:
+                    return _pick_best_client_po(msa_match).id
+            if candidates:
+                return _pick_best_client_po(candidates).id
 
         return None
 
@@ -298,19 +351,20 @@ class FinancialClassificationService:
         self, data: Dict[str, Any], document: Document
     ) -> Optional[str]:
         """Auto-link a Client Invoice to a Client PO."""
-        # 1. Exact PO number
+        # 1. Exact PO number (most reliable)
         po_num = data.get("po_number") or document.po_number
         if po_num:
             cpo = self.client_po_repo.get_by_po_number(po_num)
             if cpo:
                 return cpo.id
 
-        # 2. Client name (unique match)
-        client = data.get("client") or document.client
-        if client:
+        # 2. Client name match — use _pick_best_client_po so multi-PO
+        #    clients still get linked (previously only linked if exactly 1 PO)
+        client = _normalize_client(data.get("client") or document.client)
+        if client and client != "Unknown Client":
             candidates = self.client_po_repo.get_by_client_name(client)
-            if len(candidates) == 1:
-                return candidates[0].id
+            if candidates:
+                return _pick_best_client_po(candidates).id
 
         return None
 

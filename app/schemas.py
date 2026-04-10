@@ -546,6 +546,22 @@ class VendorWithInvoices(BaseModel):
     invoices: List[VendorInvoiceResponse]
 
 
+class LinkedDocumentSummary(BaseModel):
+    id: str
+    title: str
+    category: str
+    amount: float
+    currency: str
+    status: str
+    po_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    msa_number: Optional[str] = None
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ClientWithVendors(BaseModel):
     client_name: str
     total_po_value: float
@@ -553,6 +569,7 @@ class ClientWithVendors(BaseModel):
     client_pos: List[ClientPOResponse]
     client_invoices: List[ClientInvoiceResponse]
     vendors: List[VendorWithInvoices]
+    linked_documents: List[LinkedDocumentSummary] = []
 
 
 class ClientsOverviewResponse(BaseModel):
@@ -642,6 +659,40 @@ class GeneratedVendorPOResponse(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
     items: List[VendorPOItemResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# Client rename
+# ---------------------------------------------------------------------------
+
+class ClientRenameRequest(BaseModel):
+    new_name: str
+
+
+# ---------------------------------------------------------------------------
+# Document link / unlink / category
+# ---------------------------------------------------------------------------
+
+class DocumentLinkRequest(BaseModel):
+    client_name: str
+    linked_by: Optional[str] = None  # user/role from frontend auth context
+
+
+class DocumentCategoryUpdate(BaseModel):
+    category: str
+
+
+class DocumentClientLinkRecord(BaseModel):
+    id: str
+    document_id: str
+    client_name: str
+    linked_at: datetime
+    unlinked_at: Optional[datetime] = None
+    is_active: bool
+    linked_by: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -31,7 +31,7 @@ def _run_relink():
 
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(_run_relink, "interval", minutes=1, id="relink_job")
+scheduler.add_job(_run_relink, "interval", minutes=5, id="relink_job")
 
 
 @asynccontextmanager

@@ -268,6 +268,26 @@ class GeneratedVendorPO(Base):
     vendor_po = relationship("VendorPO", foreign_keys=[vendor_po_id])
 
 
+class DocumentClientLink(Base):
+    """
+    Audit log of every manual document → client assignment made via the UI.
+    An active link (is_active=True) means the document is currently assigned
+    to that client. Unlinking sets is_active=False and records unlinked_at.
+    """
+    __tablename__ = "document_client_links"
+
+    id = Column(String, primary_key=True, index=True)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=False, index=True)
+    client_name = Column(String, nullable=False, index=True)
+    linked_at = Column(DateTime(timezone=True), server_default=func.now())
+    unlinked_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    # Optional: track who made the change (user/role from auth context)
+    linked_by = Column(String, nullable=True)
+
+    document = relationship("Document", foreign_keys=[document_id])
+
+
 class GeneratedVendorPOItem(Base):
     """Line items for a GeneratedVendorPO."""
     __tablename__ = "generated_vendor_po_items"

@@ -38,6 +38,7 @@ from app.schemas import (
     MarginSummary, ClientPOLineage,
     VendorPOConsumption, BillingViolationsResponse, GlobalMarginSummary,
     VendorWithInvoices, ClientWithVendors, ClientsOverviewResponse,
+    ClientRenameRequest, LinkedDocumentSummary,
 )
 
 router = APIRouter(prefix="/api/financial", tags=["financial"])
@@ -557,12 +558,28 @@ async def get_clients_overview(db: Session = Depends(get_db)):
         for client_name, cpos in clients_map.items():
             client_po_ids = [cpo.id for cpo in cpos]
 
-            # Client invoices linked to any of this client's POs
-            client_invoices = (
+            # Client invoices: those linked to a PO + those unlinked but with matching client_name
+            # (the latter appear when a user has corrected fields but the PO doesn't exist yet)
+            po_linked_inv_ids: set = set()
+            client_invoices_by_po = (
                 db.query(ClientInvoice)
                 .filter(ClientInvoice.client_po_id.in_(client_po_ids))
                 .all()
             )
+            po_linked_inv_ids = {i.id for i in client_invoices_by_po}
+
+            client_invoices_by_name = (
+                db.query(ClientInvoice)
+                .filter(
+                    ClientInvoice.client_po_id.is_(None),
+                    ClientInvoice.client_name == client_name,
+                )
+                .all()
+            )
+            # Merge: prefer PO-linked records, append unlinked ones not already included
+            client_invoices = client_invoices_by_po + [
+                i for i in client_invoices_by_name if i.id not in po_linked_inv_ids
+            ]
 
             # Vendor POs linked to any of this client's POs
             vendor_pos = (
@@ -592,6 +609,14 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                     invoices=[VendorInvoiceResponse.model_validate(i) for i in invoices],
                 ))
 
+            from app.models import Document
+            linked_docs = (
+                db.query(Document)
+                .filter(Document.client == client_name)
+                .order_by(Document.created_at.desc())
+                .all()
+            )
+
             clients_result.append(ClientWithVendors(
                 client_name=client_name,
                 total_po_value=sum(cpo.total_value for cpo in cpos),
@@ -599,6 +624,18 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                 client_pos=[ClientPOResponse.model_validate(c) for c in cpos],
                 client_invoices=[ClientInvoiceResponse.model_validate(i) for i in client_invoices],
                 vendors=vendors_result,
+                linked_documents=[LinkedDocumentSummary(
+                    id=d.id,
+                    title=d.title,
+                    category=d.category,
+                    amount=d.amount,
+                    currency=d.currency,
+                    status=d.status,
+                    po_number=d.po_number,
+                    invoice_number=d.invoice_number,
+                    msa_number=d.msa_number,
+                    created_at=d.created_at.isoformat() if d.created_at else None,
+                ) for d in linked_docs],
             ))
 
         return ClientsOverviewResponse(
@@ -608,6 +645,37 @@ async def get_clients_overview(db: Session = Depends(get_db)):
     except Exception as e:
         import traceback
         print(f"❌ clients-overview error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/clients/{client_name}/rename")
+async def rename_client(client_name: str, payload: ClientRenameRequest, db: Session = Depends(get_db)):
+    from app.models import Document, ClientInvoice, VendorPO as VendorPOModel
+
+    new_name = payload.new_name.strip()
+    if not new_name:
+        raise HTTPException(status_code=422, detail="new_name cannot be empty")
+    if new_name.lower() == client_name.lower():
+        return {"updated": 0, "message": "Name unchanged"}
+
+    try:
+        updated = 0
+        for row in db.query(ClientPO).filter(ClientPO.client_name == client_name).all():
+            row.client_name = new_name
+            updated += 1
+        for row in db.query(ClientInvoice).filter(ClientInvoice.client_name == client_name).all():
+            row.client_name = new_name
+            updated += 1
+        for row in db.query(VendorPOModel).filter(VendorPOModel.client_name == client_name).all():
+            row.client_name = new_name
+            updated += 1
+        for row in db.query(Document).filter(Document.client == client_name).all():
+            row.client = new_name
+            updated += 1
+        db.commit()
+        return {"updated": updated, "old_name": client_name, "new_name": new_name}
+    except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 
