@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 import asyncio
 import re
 from typing import List, Set
@@ -10,11 +11,94 @@ from app.config import settings
 from app.schemas import UploadedFile, UploadResponse, DocumentCreate
 from app.services.pdf_processor import PDFProcessor
 from app.services.alert_generator import AlertGenerator
+from app.utils.msa import normalize_msa_number
+
+# ---------------------------------------------------------------------------
+# Title sanitization helpers (module-level so they can be tested independently)
+# ---------------------------------------------------------------------------
+
+# Common English function words — a high density of these in a short string
+# is a strong signal that the "title" is actually a sentence fragment.
+_FUNCTION_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "that", "this", "these", "those", "such", "between", "which", "its",
+    "as", "not", "have", "has", "had", "will", "shall", "may", "any",
+    "all", "their", "it", "if", "but", "so", "do", "does", "did",
+    "no", "nor", "than", "into", "upon", "about", "above", "below",
+    "after", "before", "during", "without", "within", "against",
+    "through", "conditions", "terms", "parties", "contract", "agreement",
+    "governed", "signed", "pursuant", "accordance",
+})
+
+def _looks_like_sentence(text: str) -> bool:
+    """
+    Returns True if text looks like a prose sentence rather than a
+    document identifier (PO number, invoice number, type label, etc.).
+
+    Heuristics:
+    - More than 6 words
+    - Contains a comma mid-phrase (not just "LLC, Inc")
+    - More than 40% of words are common function/boilerplate words
+    """
+    if not text:
+        return False
+    words = text.split()
+    if len(words) > 6:
+        # Check for mid-phrase comma (not trailing)
+        if "," in text.rstrip(","):
+            return True
+        # High function-word density
+        fw_count = sum(1 for w in words if w.lower().rstrip(".,;:") in _FUNCTION_WORDS)
+        if fw_count / len(words) > 0.40:
+            return True
+    return False
+
+
+def _sanitize_title(raw_title: str | None, extracted_data: dict, filename: str) -> str:
+    """
+    Return a clean, short document identifier for use as the document title.
+
+    Priority:
+      1. po_number          (most reliable identifier for POs)
+      2. invoice_number     (most reliable identifier for invoices)
+      3. raw_title          — but only if it does NOT look like a sentence
+      4. document type label extracted from the summary/first line
+      5. filename stem      (last resort)
+    """
+    # 1 & 2 already checked by caller, but we handle them here for reuse
+    po = (extracted_data.get("po_number") or "").strip()
+    inv = (extracted_data.get("invoice_number") or "").strip()
+    if po:
+        return po
+    if inv:
+        return inv
+
+    # 3. Use raw title if it's a short identifier
+    if raw_title and not _looks_like_sentence(raw_title):
+        # Hard cap — identifiers are never this long
+        if len(raw_title) <= 80:
+            return raw_title.strip()
+
+    # 4. Try to pull a clean label from the summary (first line only)
+    summary = (extracted_data.get("summary") or "").strip()
+    first_summary_line = summary.split("\n")[0].strip() if summary else ""
+    if first_summary_line and not _looks_like_sentence(first_summary_line) and len(first_summary_line) <= 80:
+        return first_summary_line
+
+    # 5. Fall back to filename stem (without extension)
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return stem or "Document"
+
 
 class UploadService:
-    # Class-level set to track files currently being processed (shared across instances)
-    _processing_files: Set[str] = set()
-    
+    # Per-filename asyncio locks — prevents the same file being processed
+    # concurrently within a single process/event loop.
+    # Note: does not protect across multiple Gunicorn workers; for multi-worker
+    # deployments add a Redis-based distributed lock around process_uploaded_pdf.
+    _file_locks: dict = {}
+    _file_locks_meta: Set[str] = set()  # tracks which filenames are in-flight
+
     def __init__(self):
         self.upload_dir = settings.upload_dir
         self.max_file_size = settings.max_file_size
@@ -61,24 +145,6 @@ class UploadService:
                 # Fallback to UUID if we can't find a unique name
                 return f"{name}_{uuid.uuid4().hex[:8]}{ext}"
     
-    MSA_PATTERN = re.compile(r"(MSA[\s#:\-]*\d{3,}(?:[-/]\d{2,})?)", re.IGNORECASE)
-
-    def _normalize_msa_number(self, value: str | None) -> str | None:
-        if not value:
-            return None
-        cleaned = value.strip().upper().replace(" ", "").replace("_", "-")
-        match = self.MSA_PATTERN.search(cleaned)
-        if not match:
-            generic = re.search(r"(\d{4}[-/]\d{3,})", cleaned)
-            if generic:
-                cleaned = generic.group(1)
-            else:
-                return None
-        else:
-            cleaned = match.group(1)
-        if not cleaned.startswith("MSA"):
-            cleaned = f"MSA-{cleaned}"
-        return cleaned
 
     async def upload_files(self, files: List[UploadFile]) -> UploadResponse:
         uploads = []
@@ -178,18 +244,17 @@ class UploadService:
                 "error": error_msg,
                 "error_type": "file_not_found"
             }
-            return {"success": False, "error": "File not found"}
         
         # Check if it's a PDF
         if not filename.lower().endswith('.pdf'):
             return {"success": False, "error": "File is not a PDF"}
         
         # Check if file is already being processed (prevent duplicate processing)
-        if filename in self._processing_files:
+        if filename in self._file_locks_meta:
             return {
-                "success": False, 
+                "success": False,
                 "error": f"File '{filename}' is already being processed. Please wait.",
-                "already_processing": True
+                "already_processing": True,
             }
         
         # Check if document already exists in database (by filename)
@@ -261,25 +326,32 @@ class UploadService:
             print(f"⚠️  File exists in S3 but no processed data found. Will re-process using S3 file.")
             # Continue to processing - the PDFProcessor will use the existing S3 file
         
-        # Mark file as being processed
-        self._processing_files.add(filename)
+        # Acquire per-filename lock (asyncio-safe within a single process)
+        if filename not in self._file_locks:
+            self._file_locks[filename] = asyncio.Lock()
+        lock = self._file_locks[filename]
+        if lock.locked():
+            return {
+                "success": False,
+                "error": f"File '{filename}' is already being processed. Please wait.",
+                "already_processing": True,
+            }
+        self._file_locks_meta.add(filename)
         
-        try:
-            # Process the PDF (will upload to S3 and process with Textract)
-            result = await self.pdf_processor.process_pdf(file_path)
-            
-            # Check if processing was skipped due to existing file
-            if result.get("already_exists", False):
-                return result
-            
-            # Save the processed document if successful
-            if result.get("success", False):
-                self.save_processed_document(result)
-                
-                # Save to database and generate alerts if db session is provided
-                if db:
-                    try:
-                        # Check again if document exists using extracted data (more thorough check)
+        async with lock:
+            try:
+                # Process the PDF (will upload to S3 and process with Textract)
+                result = await self.pdf_processor.process_pdf(file_path)
+
+                # Check if processing was skipped due to existing file
+                if result.get("already_exists", False):
+                    return result
+
+                # Save the processed document if successful
+                if result.get("success", False):
+                    self.save_processed_document(result)
+
+                    if db:
                         extracted_data = result.get("extracted_data", {})
                         existing_doc = self._check_document_exists_in_db(filename, db, extracted_data)
                         if existing_doc:
@@ -287,26 +359,65 @@ class UploadService:
                             result["already_exists"] = True
                             result["document_db_id"] = existing_doc.id
                             return result
-                        
-                        document = self._save_to_database(result, filename, db)
-                        if document:
-                            # Generate alerts for the new document
-                            alert_generator = AlertGenerator(db)
-                            alerts = alert_generator.generate_alerts_for_document(document)
+
+                        # ── Step A: Save document row and commit it independently ──
+                        # This ensures the document is never lost even if financial
+                        # classification fails afterwards.
+                        try:
+                            document = self._save_to_database(result, filename, db)
                             db.commit()
-                            result["alerts_generated"] = len(alerts)
-                            result["document_db_id"] = document.id
-                    except Exception as e:
-                        print(f"Error saving to database or generating alerts: {e}")
-                        # Don't fail the whole process if DB save fails
-                        if db:
+                        except Exception as save_err:
+                            print(f"❌ Failed to save document to database: {save_err}")
                             db.rollback()
-            
-            return result
-        finally:
-            # Remove from processing set after completion (with a small delay to prevent rapid re-processing)
-            await asyncio.sleep(2)  # Wait 2 seconds before allowing re-processing
-            self._processing_files.discard(filename)
+                            return result  # return OCR result even without DB row
+
+                        if document:
+                            result["document_db_id"] = document.id
+
+                            # ── Step B: Financial classification (isolated commit) ──
+                            financial_record = None
+                            try:
+                                from app.services.financial_classification_service import FinancialClassificationService
+                                from app.services.invoice_matching_service import InvoiceMatchingService
+                                from app.services.billing_validation_service import BillingValidationService
+                                fin_svc = FinancialClassificationService(db)
+                                financial_record = fin_svc.classify_and_create(document, extracted_data)
+                                db.commit()
+                            except Exception as fin_err:
+                                print(f"⚠️  Financial classification failed for {filename}: {fin_err}")
+                                db.rollback()
+                                # Document row is already committed — only financial record is lost
+
+                            # ── Step C: Invoice matching + overbilling (isolated commit) ──
+                            if financial_record and document.category == "Vendor Invoice":
+                                try:
+                                    from app.models import VendorInvoice as VendorInvoiceModel
+                                    if isinstance(financial_record, VendorInvoiceModel):
+                                        matching_svc = InvoiceMatchingService(db)
+                                        matching_svc.run_full_validation(financial_record)
+                                        if financial_record.vendor_po_id:
+                                            BillingValidationService(db).check_vendor_po_overbilling(
+                                                financial_record.vendor_po_id
+                                            )
+                                        db.commit()
+                                except Exception as match_err:
+                                    print(f"⚠️  Invoice matching/billing check failed for {filename}: {match_err}")
+                                    db.rollback()
+
+                            # ── Step D: Alert generation (isolated commit) ──
+                            try:
+                                alert_generator = AlertGenerator(db)
+                                alerts = alert_generator.generate_alerts_for_document(document)
+                                db.commit()
+                                result["alerts_generated"] = len(alerts)
+                            except Exception as alert_err:
+                                print(f"⚠️  Alert generation failed for {filename}: {alert_err}")
+                                db.rollback()
+                                result["alerts_generated"] = 0
+
+                return result
+            finally:
+                self._file_locks_meta.discard(filename)
     
     def _save_to_database(self, result: dict, filename: str, db: Session):
         """Save processed document to database"""
@@ -338,20 +449,18 @@ class UploadService:
         
         # Create document
         document_service = DocumentService(db)
-        document_title = (
-            extracted_data.get("po_number")
-            or extracted_data.get("invoice_number")
-            or extracted_data.get("title")
-            or filename
+        document_title = _sanitize_title(
+            extracted_data.get("title"), extracted_data, filename
         )
 
-        normalized_msa = self._normalize_msa_number(extracted_data.get("msa_number"))
+        normalized_msa = normalize_msa_number(extracted_data.get("msa_number"))
 
+        from app.services.financial_classification_service import _normalize_client, _normalize_vendor
         document_create = DocumentCreate(
             title=document_title,
             category=document_type,
-            client=extracted_data.get("client", "Unknown Client"),
-            vendor=extracted_data.get("vendor"),
+            client=_normalize_client(extracted_data.get("client")),
+            vendor=_normalize_vendor(extracted_data.get("vendor")) if extracted_data.get("vendor") else None,
             amount=float(extracted_data.get("amount", 0)),
             currency=extracted_data.get("currency", "USD"),
             status="Draft",
@@ -370,7 +479,7 @@ class UploadService:
         
         if existing_doc:
             updated = False
-            normalized_msa = self._normalize_msa_number(extracted_data.get("msa_number"))
+            normalized_msa = normalize_msa_number(extracted_data.get("msa_number"))
             if normalized_msa and existing_doc.msa_number != normalized_msa:
                 existing_doc.msa_number = normalized_msa
                 updated = True
@@ -388,6 +497,12 @@ class UploadService:
             id=document_id,
             **document_create.dict()
         )
+        # EXTRACTED  — raw OCR text came back from Textract
+        # CLASSIFIED — document type was identified
+        # PARSED     — structured fields were extracted from text
+        # (VALIDATED / FAILED are set later by FinancialClassificationService)
+        db_document.processing_status = "PARSED"
+        db_document.extracted_json = json.dumps(extracted_data, default=str)
         db.add(db_document)
         db.commit()
         db.refresh(db_document)

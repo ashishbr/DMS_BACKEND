@@ -40,6 +40,10 @@ backend/processed/
 *.swo
 .DS_Store
 
+# Claude
+.claude/settings.local.json
+.claude/worktrees/
+
 # Logs
 *.log
 logs/

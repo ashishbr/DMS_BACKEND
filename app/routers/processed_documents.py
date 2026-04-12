@@ -1,65 +1,59 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict
 from app.services.pdf_processor import PDFProcessor
+import asyncio
 import os
 import json
 
 router = APIRouter(prefix="/api/processed-documents", tags=["processed-documents"])
 
+
+def _read_processed_documents_sync():
+    processor = PDFProcessor()
+    processed_dir = processor.processed_dir
+
+    if not os.path.exists(processed_dir):
+        return {"documents": []}
+
+    documents = []
+    seen_document_ids = set()
+
+    for filename in os.listdir(processed_dir):
+        if filename.endswith('.json'):
+            file_path = os.path.join(processed_dir, filename)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                    # Skip if not successful
+                    if not data.get('success', False):
+                        continue
+
+                    # Deduplicate strictly by document_id only —
+                    # content-based dedup (title+amount+client) incorrectly
+                    # collapses distinct documents that share those values.
+                    doc_id = data.get('document_id')
+                    if not doc_id or doc_id in seen_document_ids:
+                        continue
+
+                    seen_document_ids.add(doc_id)
+                    doc_summary = {k: v for k, v in data.items() if k != "full_text"}
+                    documents.append(doc_summary)
+            except Exception as e:
+                print(f"Error reading {filename}: {e}")
+                continue
+
+    # Sort by processing time (newest first)
+    documents.sort(key=lambda x: x.get('processing_time', ''), reverse=True)
+
+    return {"documents": documents}
+
+
 @router.get("/")
 async def get_processed_documents():
     """Get list of processed documents with their extracted content"""
     try:
-        processor = PDFProcessor()
-        processed_dir = processor.processed_dir
-        
-        if not os.path.exists(processed_dir):
-            return {"documents": []}
-        
-        documents = []
-        
-        # Read all processed files
-        seen_document_ids = set()
-        seen_keys = set()  # For deduplication by title+amount+client
-        
-        for filename in os.listdir(processed_dir):
-            if filename.endswith('.json'):
-                file_path = os.path.join(processed_dir, filename)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        
-                        # Skip if not successful
-                        if not data.get('success', False):
-                            continue
-                        
-                        # Deduplicate by document_id
-                        doc_id = data.get('document_id')
-                        if doc_id and doc_id in seen_document_ids:
-                            continue
-                        
-                        # Also deduplicate by title+amount+client
-                        extracted = data.get('extracted_data', {})
-                        title = extracted.get('title', '')
-                        amount = extracted.get('amount', 0)
-                        client = extracted.get('client', '')
-                        dedup_key = f"{title}_{amount}_{client}"
-                        
-                        if dedup_key in seen_keys:
-                            continue
-                        
-                        seen_document_ids.add(doc_id)
-                        seen_keys.add(dedup_key)
-                        documents.append(data)
-                except Exception as e:
-                    print(f"Error reading {filename}: {e}")
-                    continue
-        
-        # Sort by processing time (newest first)
-        documents.sort(key=lambda x: x.get('processing_time', ''), reverse=True)
-        
-        return {"documents": documents}
-        
+        return await asyncio.to_thread(_read_processed_documents_sync)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get processed documents: {str(e)}")
 

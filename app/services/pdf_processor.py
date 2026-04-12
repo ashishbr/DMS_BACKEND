@@ -24,6 +24,7 @@ class PDFProcessor:
         # Initialize AWS clients
         self.textract_client = None
         self.s3_client = None
+        self.bedrock_client = None
         self._initialize_aws_clients()
     
     def _initialize_aws_clients(self):
@@ -42,7 +43,8 @@ class PDFProcessor:
             
             self.textract_client = boto3.client('textract', **aws_config)
             self.s3_client = boto3.client('s3', **aws_config)
-            
+            self.bedrock_client = boto3.client('bedrock-runtime', **aws_config)
+
         except Exception as e:
             print(f"Warning: Failed to initialize AWS clients: {e}")
             print("Textract will not be available. Please configure AWS credentials.")
@@ -164,8 +166,8 @@ class PDFProcessor:
                     "processing_time": datetime.now().isoformat()
                 }
             
-            # Poll for job completion
-            text_content = self._wait_for_textract_job(job_id)
+            # Poll for job completion (non-blocking)
+            text_content = await self._wait_for_textract_job(job_id)
             if not text_content:
                 # Clean up S3 file
                 self._cleanup_s3_file(temp_s3_key)
@@ -188,16 +190,34 @@ class PDFProcessor:
                 # If organization failed, just clean up temp file
                 self._cleanup_s3_file(temp_s3_key)
             
-            # Extract structured data
-            extracted_data = self._extract_structured_data(text_content, document_type, "")
+            # Extract structured data — try Bedrock first, fall back to regex
+            try:
+                extracted_data = self._extract_structured_data_bedrock(text_content, document_type)
+                print(f"✅ Extracted structured data via Bedrock")
+            except Exception as bedrock_err:
+                print(f"⚠️  Bedrock extraction failed ({bedrock_err}), falling back to regex extraction")
+                extracted_data = self._extract_structured_data(text_content, document_type, "")
 
-            # Force document type based on extracted identifiers
-            if extracted_data.get("invoice_number"):
-                document_type = "Client Invoice"
-            elif extracted_data.get("po_number"):
-                document_type = "Client PO"
-            elif extracted_data.get("msa_number"):
-                document_type = "Service Agreement"
+            # Refine document type from extracted identifiers ONLY when classification is ambiguous.
+            # Never downgrade a specific vendor/client type to a generic one.
+            _specific_types = {"Client PO", "Vendor PO", "Client Invoice", "Vendor Invoice", "Service Agreement"}
+            if document_type not in _specific_types:
+                # Fall back to identifier-based heuristic when classifier returned Unknown
+                if extracted_data.get("invoice_number"):
+                    # Use vendor keyword in text to disambiguate
+                    _is_vendor_doc = any(
+                        w in text_content.lower()
+                        for w in ["vendor:", "supplier:", "vendor name", "invoice from"]
+                    )
+                    document_type = "Vendor Invoice" if _is_vendor_doc else "Client Invoice"
+                elif extracted_data.get("po_number"):
+                    _is_vendor_doc = any(
+                        w in text_content.lower()
+                        for w in ["vendor:", "supplier:", "vendor name", "order to"]
+                    )
+                    document_type = "Vendor PO" if _is_vendor_doc else "Client PO"
+                elif extracted_data.get("msa_number"):
+                    document_type = "Service Agreement"
             
             # Calculate confidence score
             confidence = self._calculate_confidence(text_content, document_type)
@@ -234,51 +254,49 @@ class PDFProcessor:
                 "processing_time": datetime.now().isoformat()
             }
     
-    def _wait_for_textract_job(self, job_id: str, max_wait_time: int = 300) -> Optional[str]:
-        """Wait for Textract job to complete and return extracted text"""
+    async def _wait_for_textract_job(self, job_id: str, max_wait_time: int = 300) -> Optional[str]:
+        """Wait for Textract job to complete and return extracted text.
+        Uses asyncio.sleep so the event loop stays free during polling.
+        """
+        import asyncio
         start_time = time.time()
-        
+
         while time.time() - start_time < max_wait_time:
             try:
-                response = self.textract_client.get_document_text_detection(JobId=job_id)
+                response = await asyncio.to_thread(
+                    self.textract_client.get_document_text_detection, JobId=job_id
+                )
                 status = response['JobStatus']
-                
+
                 if status == 'SUCCEEDED':
-                    # Extract text from blocks
                     text_lines = []
-                    next_token = None
-                    
                     while True:
                         for block in response.get('Blocks', []):
                             if block['BlockType'] == 'LINE':
                                 text_lines.append(block.get('Text', ''))
-                        
-                        # Check if there are more pages
                         next_token = response.get('NextToken')
                         if not next_token:
                             break
-                        
-                        response = self.textract_client.get_document_text_detection(
+                        response = await asyncio.to_thread(
+                            self.textract_client.get_document_text_detection,
                             JobId=job_id,
-                            NextToken=next_token
+                            NextToken=next_token,
                         )
-                    
                     return '\n'.join(text_lines)
-                
+
                 elif status == 'FAILED':
                     error_message = response.get('StatusMessage', 'Unknown error')
                     print(f"Textract job failed: {error_message}")
                     return None
-                
+
                 elif status in ['IN_PROGRESS', 'PARTIAL_SUCCESS']:
-                    # Wait before checking again
-                    time.sleep(2)
+                    await asyncio.sleep(2)  # non-blocking wait
                     continue
-                
+
             except ClientError as e:
                 print(f"Error checking Textract job status: {e}")
                 return None
-        
+
         print(f"Textract job timed out after {max_wait_time} seconds")
         return None
     
@@ -325,50 +343,54 @@ class PDFProcessor:
             return None
     
     def _get_existing_processed_data(self, filename: str, s3_key: str = None) -> Optional[Dict]:
-        """Try to retrieve existing processed data for a file from local storage
-        Matches by checking if the processed data references the same S3 location or filename
+        """Try to retrieve existing processed data for a file from local storage.
+        Matches by document_id prefix derived from the filename, or by the
+        stored pdf_url/file_path field — never by filename-in-title (unreliable).
         """
+        import json as _json
         try:
-            # Check if processed JSON file exists
             processed_dir = self.processed_dir
             if not os.path.exists(processed_dir):
                 return None
-            
-            # Look for JSON files that might contain this filename
+
+            # Build a set of reliable match targets from the filename
+            name_stem = os.path.splitext(filename)[0].lower()  # e.g. "po_6000139634"
+            pdf_url_suffix = f"/uploads/{filename}".lower()
+
             for json_file in os.listdir(processed_dir):
-                if json_file.endswith('.json'):
-                    json_path = os.path.join(processed_dir, json_file)
-                    try:
-                        import json
-                        with open(json_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            
-                            # Check if this processed data is for the same file
-                            if not data.get('success', False):
-                                continue
-                            
-                            # Try to match by checking extracted_data for filename patterns
-                            # or by checking if the document was processed from the same S3 location
-                            extracted_data = data.get('extracted_data', {})
-                            
-                            # Check if we can match by filename in the extracted data
-                            # Some documents might have the filename in title or other fields
-                            title = extracted_data.get('title', '').lower()
-                            if filename.lower() in title or title in filename.lower():
-                                return data
-                            
-                            # If S3 key is provided, we could also check metadata
-                            # For now, we'll do a simple check: if the document_id format matches
-                            # the expected pattern for this filename, it might be a match
-                            # But this is not perfect, so we'll be conservative
-                            
-                    except Exception as e:
-                        print(f"Warning: Error reading processed file {json_file}: {e}")
+                if not json_file.endswith('.json'):
+                    continue
+                json_path = os.path.join(processed_dir, json_file)
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        data = _json.load(f)
+
+                    if not data.get('success', False):
                         continue
-            
-            # No matching processed data found
+
+                    # Match 1: document_id contains the filename stem
+                    doc_id = (data.get('document_id') or '').lower()
+                    if name_stem and name_stem in doc_id:
+                        return data
+
+                    # Match 2: stored pdf_url ends with /uploads/<filename>
+                    extracted = data.get('extracted_data', {})
+                    stored_pdf_url = (extracted.get('pdf_url') or '').lower()
+                    if stored_pdf_url and stored_pdf_url.endswith(pdf_url_suffix):
+                        return data
+
+                    # Match 3: S3 key suffix matches filename
+                    if s3_key and filename.lower() in s3_key.lower():
+                        stored_s3 = data.get('s3_key', '')
+                        if stored_s3 and filename.lower() in stored_s3.lower():
+                            return data
+
+                except Exception as e:
+                    print(f"Warning: Error reading processed file {json_file}: {e}")
+                    continue
+
             return None
-            
+
         except Exception as e:
             print(f"Warning: Error getting existing processed data: {e}")
             return None
@@ -541,29 +563,107 @@ class PDFProcessor:
         return ' | '.join(text_parts)
     
     def _classify_document(self, text: str) -> str:
-        """Classify document type using keyword matching"""
+        """Classify document type using keyword matching with vendor/client disambiguation."""
         text_lower = text.lower()
-        
-        # Define keywords for each document type
-        type_keywords = {
-            "Client PO": ["purchase order", "client", "po", "order from"],
-            "Vendor PO": ["purchase order", "vendor", "supplier", "order to"],
-            "Client Invoice": ["invoice", "client", "bill to", "invoice to"],
-            "Vendor Invoice": ["invoice", "vendor", "supplier", "invoice from"],
-            "Service Agreement": ["master service agreement", "msa", "service agreement", "agreement", "contract", "scope summary", "expiration date"]
+
+        # Strong discriminating signals — checked first, highest priority
+        strong_signals = {
+            "Vendor Invoice": ["vendor invoice", "invoice from vendor", "supplier invoice"],
+            "Client Invoice": ["client invoice", "invoice to client", "bill to client"],
+            "Vendor PO": ["vendor purchase order", "vendor po", "purchase order to vendor",
+                          "order to supplier", "purchase order\nvendor"],
+            "Client PO": ["client purchase order", "client po", "purchase order from client",
+                          "order from client"],
+            "Service Agreement": ["master service agreement", "msa", "service agreement",
+                                  "scope summary", "expiration date"],
         }
-        
-        scores = {}
-        for doc_type, keywords in type_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            scores[doc_type] = score
-        
-        # Return the type with highest score, or "Unknown" if no match
-        if scores and max(scores.values()) > 0:
-            return max(scores, key=scores.get)
-        
+        for doc_type, signals in strong_signals.items():
+            if any(sig in text_lower for sig in signals):
+                return doc_type
+
+        # Heading / title line classification (first 300 chars usually has the document title)
+        header = text_lower[:300]
+        if "vendor invoice" in header:
+            return "Vendor Invoice"
+        if "client invoice" in header or ("invoice" in header and "vendor" not in header):
+            return "Client Invoice"
+        if "vendor purchase order" in header or ("purchase order" in header and "vendor" in header):
+            return "Vendor PO"
+        if "purchase order" in header:
+            return "Client PO"
+
+        # Fallback: weighted scoring — vendor-specific vs client-specific words
+        is_vendor = any(w in text_lower for w in ["vendor:", "supplier:", "vendor name", "supplier name"])
+        is_invoice = any(w in text_lower for w in ["invoice number", "invoice #", "invoice date", "invoice amount"])
+        is_po = any(w in text_lower for w in ["po number", "purchase order number", "po #", "allocated value"])
+
+        if is_invoice:
+            return "Vendor Invoice" if is_vendor else "Client Invoice"
+        if is_po:
+            return "Vendor PO" if is_vendor else "Client PO"
+        if any(w in text_lower for w in ["msa", "agreement", "contract"]):
+            return "Service Agreement"
+
         return "Unknown"
     
+    def _extract_structured_data_bedrock(self, text: str, document_type: str) -> Dict:
+        """Extract structured data using AWS Bedrock Claude Haiku. Returns empty dict on failure."""
+        if not self.bedrock_client:
+            raise RuntimeError("Bedrock client not initialized")
+
+        import json as _json
+
+        prompt = f"""You are a document extraction assistant. Extract structured data from this {document_type} document.
+
+    Return ONLY valid JSON with these exact fields (use null if not found):
+    {{
+    "title": "SHORT document identifier only — use the PO number, invoice number, or document type label (e.g. 'TAX INVOICE', 'Purchase Order'). NEVER put a sentence, clause, or description here. Max 60 characters.",
+    "client": "string or null",
+    "vendor": "string or null",
+    "amount": 0,
+    "currency": "string or null",
+    "date": "YYYY-MM-DD or null",
+    "due_date": "YYYY-MM-DD or null",
+    "po_number": "string or null",
+    "invoice_number": "string or null",
+    "msa_number": "string or null",
+    "vendor_address": "string or null",
+    "client_address": "string or null",
+    "summary": "string or null",
+    "key_terms": ["array", "of", "keyword", "strings"],
+    "contact_info": {{"emails": [], "phones": [], "addresses": []}}
+    }}
+
+    IMPORTANT:
+    - title MUST be a short identifier (PO/invoice number, or document type label like "TAX INVOICE"). Never a sentence.
+    - key_terms MUST be a JSON array of strings.
+    - contact_info MUST be a JSON object.
+
+    Document text:
+    {text[:8000]}"""
+
+        response = self.bedrock_client.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=_json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}]
+            })
+        )
+        result = _json.loads(response['body'].read())
+        data = _json.loads(result['content'][0]['text'])
+
+        # Enforce types to match what the frontend and regex fallback expect
+        if isinstance(data.get("key_terms"), str):
+            data["key_terms"] = [t.strip() for t in data["key_terms"].split(",") if t.strip()]
+        elif not isinstance(data.get("key_terms"), list):
+            data["key_terms"] = []
+
+        if not isinstance(data.get("contact_info"), dict):
+            data["contact_info"] = {}
+
+        return data
+
     def _extract_structured_data(self, text: str, document_type: str, forms_data: str = "") -> Dict:
         """Extract structured data based on document type"""
         # Combine text and forms data for better extraction
@@ -593,6 +693,29 @@ class PDFProcessor:
         fname_lower = filename.lower()
         if "msa" in fname_lower or "agreement" in fname_lower or "contract" in fname_lower:
             return "Service Agreement"
+        # Check combined patterns first (most specific → least specific)
+        if "vendor_invoice" in fname_lower or "vendor_inv" in fname_lower:
+            return "Vendor Invoice"
+        if "client_invoice" in fname_lower or "client_inv" in fname_lower:
+            return "Client Invoice"
+        if "vendor_po" in fname_lower or "vendor_purchase" in fname_lower:
+            return "Vendor PO"
+        if "client_po" in fname_lower or "client_purchase" in fname_lower:
+            return "Client PO"
+        # Short-code patterns: vinv / cinv / vpo / cpo
+        if "vinv" in fname_lower:
+            return "Vendor Invoice"
+        if "cinv" in fname_lower:
+            return "Client Invoice"
+        if "vpo" in fname_lower:
+            return "Vendor PO"
+        if "cpo" in fname_lower:
+            return "Client PO"
+        # Generic patterns: must check "vendor" presence before falling back
+        if "vendor" in fname_lower and ("invoice" in fname_lower or "inv" in fname_lower):
+            return "Vendor Invoice"
+        if "vendor" in fname_lower and ("po" in fname_lower or "purchase" in fname_lower):
+            return "Vendor PO"
         if "invoice" in fname_lower or "inv" in fname_lower:
             return "Client Invoice"
         if "po" in fname_lower or "purchase" in fname_lower:
@@ -647,7 +770,25 @@ class PDFProcessor:
         """Extract client name with improved patterns"""
         clean_text = text.strip()
         lines = clean_text.split('\n')
-        
+
+        # Look for "ISSUED TO" label (common in PO documents) — skip generic labels
+        _GENERIC_LABELS = {'company', 'address', 'name', 'vendor', 'supplier', 'issued by', 'issued to'}
+        for i, line in enumerate(lines):
+            if 'issued to' in line.lower():
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    next_line = lines[j].strip()
+                    if (next_line
+                            and len(next_line) > 3
+                            and next_line.lower() not in _GENERIC_LABELS):
+                        # Skip the vendor name: take the second real company found
+                        # The vendor name was already captured by _extract_vendor;
+                        # here we look for a different company name that appears after it
+                        vendor = self._extract_vendor(text)
+                        if vendor and next_line == vendor:
+                            continue
+                        return next_line
+                break
+
         # Look for "Bill To" and get the company name on the next line(s)
         for i, line in enumerate(lines):
             line_lower = line.lower().strip()
@@ -712,7 +853,21 @@ class PDFProcessor:
     def _extract_vendor(self, text: str) -> str:
         """Extract vendor name with improved patterns"""
         clean_text = text.strip()
-        
+        lines = clean_text.split('\n')
+
+        # Look for "ISSUED BY" label (common in PO documents) — skip generic "Company" labels
+        _GENERIC_LABELS = {'company', 'address', 'name', 'vendor', 'supplier', 'issued by', 'issued to'}
+        for i, line in enumerate(lines):
+            if 'issued by' in line.lower():
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    next_line = lines[j].strip()
+                    if (next_line
+                            and len(next_line) > 3
+                            and next_line.lower() not in _GENERIC_LABELS
+                            and 'issued to' not in next_line.lower()):
+                        return next_line
+                break
+
         # Enhanced patterns for vendor extraction
         patterns = [
             r"Vendor:\s*(.+?)(?:\n|$)",
@@ -723,7 +878,7 @@ class PDFProcessor:
             r"Company\s+Name[:\s]*(.+?)(?:\n|$)",
             r"Business\s+Name[:\s]*(.+?)(?:\n|$)"
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, clean_text, re.IGNORECASE | re.MULTILINE)
             if match:
@@ -731,21 +886,21 @@ class PDFProcessor:
                 vendor = re.sub(r'\s+', ' ', vendor)
                 if len(vendor) > 3 and len(vendor) < 100:
                     return vendor
-        
+
         # Look for company names in document headers (for vendor invoices)
         company_patterns = [
             r"^([A-Z][A-Z\s&]+(?:LTD|LLC|INC|CORP|COMPANY|LLP))",
             r"^([A-Z][A-Z\s&]+(?:TECHNOLOGY|SERVICES|SOLUTIONS|SYSTEMS))",
             r"^([A-Z][A-Z\s&]+(?:DIGITAL|INFORMATION|CONSULTING))"
         ]
-        
+
         for pattern in company_patterns:
             match = re.search(pattern, clean_text, re.MULTILINE)
             if match:
                 company = match.group(1).strip()
                 if len(company) > 5 and len(company) < 80:
                     return company
-        
+
         return None
     
     def _extract_amount(self, text: str) -> float:
@@ -756,13 +911,13 @@ class PDFProcessor:
         # Priority patterns - look for invoice total, amount due, grand total first
         # Highest priority: Total including VAT (final amount)
         priority_patterns = [
-            (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s+([\d,]+\.?\d*)", 1.0),  # "Total Incl VAT | AED 4,473.48"
+            (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s*([\d,]+\.?\d*)", 1.0),  # "Total Incl VAT | AED 4,473.48"
             (r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)", 0.99),  # Without currency code
             (r"Invoice\s+Total\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.95),
             (r"Amount\s+Due\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.94),
-            (r"Grand\s+Total[:\s]*\$?([\d,]+\.?\d*)", 0.9),
+            (r"Grand\s+Total[:\s\n]*\$?\s*([\d,]+\.?\d*)", 0.9),
             (r"Total\s+[A-Z]{3}[:\s]*([\d,]+\.?\d*)", 0.85),
-            (r"Final\s+Amount[:\s]*\$?([\d,]+\.?\d*)", 0.8),
+            (r"Final\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)", 0.8),
         ]
         
         amounts_with_priority = []
@@ -782,20 +937,20 @@ class PDFProcessor:
             amounts_with_priority.sort(key=lambda x: x[1], reverse=True)
             return amounts_with_priority[0][0]
         
-        # Fallback to all patterns
+        # Fallback to all patterns — \$?\s* handles "$ 125,000.00" (space after $)
         patterns = [
-            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s+([\d,]+\.?\d*)",  # "Total Incl VAT | AED 4,473.48"
-            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)",  # Total including VAT without currency
-            r"Invoice\s+Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Amount\s+Due[:\s]*\$?([\d,]+\.?\d*)",
-            r"Grand\s+Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Total\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Final\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Net\s+Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Total[:\s]*\$?([\d,]+\.?\d*)",
-            r"Amount[:\s]*\$?([\d,]+\.?\d*)",
-            r"Balance[:\s]*\$?([\d,]+\.?\d*)",
-            r"Due[:\s]*\$?([\d,]+\.?\d*)",
+            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*[A-Z]{3}\s*([\d,]+\.?\d*)",
+            r"Total\s+Incl(?:uding)?\s+VAT[:\s\|]*([\d,]+\.?\d*)",
+            r"Invoice\s+Total[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Amount\s+Due[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Grand\s+Total[:\s\n]*\$?\s*([\d,]+\.?\d*)",
+            r"Total\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Final\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Net\s+Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Total[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Amount[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Balance[:\s]*\$?\s*([\d,]+\.?\d*)",
+            r"Due[:\s]*\$?\s*([\d,]+\.?\d*)",
         ]
         
         amounts = []
@@ -873,10 +1028,13 @@ class PDFProcessor:
         clean_text = text.strip()
         lines = clean_text.split('\n')
         
-        # Look for "Invoice Date" or "Date" label and get the value on the next line
+        # Look for document date labels and get the value on the next line(s)
+        date_label_keywords = ['invoice date', 'po date', 'order date', 'purchase order date', 'issue date', 'issued date']
         for i, line in enumerate(lines):
             line_lower = line.lower().strip()
-            if 'invoice date' in line_lower or ('date' in line_lower and 'invoice' in clean_text[max(0, i-2):i+2].lower()):
+            if any(kw in line_lower for kw in date_label_keywords) or (
+                'date' in line_lower and 'invoice' in clean_text[max(0, i-2):i+2].lower()
+            ):
                 # Get the next non-empty line which should be the date
                 for j in range(i + 1, min(i + 3, len(lines))):
                     next_line = lines[j].strip()
@@ -886,13 +1044,18 @@ class PDFProcessor:
                         if date_str:
                             return date_str
         
-        # Enhanced date patterns - handle multiple formats
+        # Enhanced date patterns - handle multiple formats and document types
         patterns = [
-            # Format: "13 Sep 2025" or "13 September 2025"
+            # "DD Mon YYYY" format
             (r"Invoice\s+Date[:\s]*\n\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"PO\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"Order\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
+            (r"Issue\s+Date[:\s]*\n?\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
             (r"Date[:\s]*\n\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", True),
-            # Format: "13/09/2025" or "13-09-2025"
+            # "DD/MM/YYYY" or "DD-MM-YYYY" format
             (r"Invoice\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
+            (r"PO\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
+            (r"Order\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Issue\s+Date[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
             (r"Created[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", False),
@@ -1132,36 +1295,51 @@ class PDFProcessor:
                             if len(invoice_number) > 2:
                                 return invoice_number
         
-        # Enhanced invoice number patterns (fallback)
+        # Words that look like invoice number matches but aren't
+        _INVOICE_EXCLUDED = {'date', 'number', 'no', 'total', 'amount', 'due', 'from', 'to', 'period', 'tax'}
+
+        # Enhanced invoice number patterns (fallback) — must contain at least one digit
         patterns = [
             r"Invoice\s+Number[:\s]*\n\s*([A-Z0-9/_-]+)",
-            r"Invoice\s*#?\s*([A-Z0-9/_-]+)",
-            r"Inv\s*#?\s*([A-Z0-9/_-]+)",
-            r"Bill\s*#?\s*([A-Z0-9/_-]+)",
+            r"Invoice\s*#\s*([A-Z0-9/_-]+)",       # explicit # required here
+            r"Inv\s*#\s*([A-Z0-9/_-]+)",            # explicit # required here
+            r"Bill\s*#\s*([A-Z0-9/_-]+)",           # explicit # required here
+            r"Invoice\s+No\.?\s*:?\s*([A-Z0-9/_-]+)",
             r"Invoice\s+Number[:\s]*([A-Z0-9/_-]+)",
             r"Bill\s+Number[:\s]*([A-Z0-9/_-]+)",
         ]
-        
+
         for pattern in patterns:
             match = re.search(pattern, clean_text, re.IGNORECASE | re.MULTILINE)
             if match:
                 invoice_number = match.group(1).strip()
-                if len(invoice_number) > 2:
+                # Must contain at least one digit and not be a common non-number word
+                if (len(invoice_number) > 2
+                        and re.search(r'\d', invoice_number)
+                        and invoice_number.lower() not in _INVOICE_EXCLUDED):
                     return invoice_number
-        
+
         return None
     
     def _extract_vendor_address(self, text: str) -> Optional[str]:
         """Extract vendor address with improved patterns"""
         clean_text = text.strip()
         lines = clean_text.split('\n')
-        
-        # Enhanced vendor address patterns
-        vendor_keywords = ['vendor', 'supplier', 'from', 'company address', 'business address', 'headquarters']
-        
+
+        # More specific vendor address triggers — avoid compound phrases like "LINKED VENDOR PO"
+        # that contain "vendor" but are not address sections.
+        _VENDOR_ADDR_LABELS = [
+            r'\bvendor\s+address\b', r'\bsupplier\s+address\b',
+            r'\bfrom\b', r'\bcompany\s+address\b',
+            r'\bbusiness\s+address\b', r'\bheadquarters\b',
+        ]
+        # Also match a line that is ONLY "vendor" or "supplier" (a section header)
+        _VENDOR_SECTION_ONLY = re.compile(r'^\s*(vendor|supplier)\s*$', re.IGNORECASE)
+
         for i, line in enumerate(lines):
             line_lower = line.lower()
-            if any(keyword in line_lower for keyword in vendor_keywords):
+            if (any(re.search(pat, line_lower) for pat in _VENDOR_ADDR_LABELS)
+                    or _VENDOR_SECTION_ONLY.match(line)):
                 address_lines = []
                 for j in range(i+1, min(i+6, len(lines))):
                     current_line = lines[j].strip()
@@ -1407,11 +1585,79 @@ class PDFProcessor:
         
         if phones:
             contact_info['phones'] = phones[:3]
-        
+
         # Addresses (simple pattern)
         address_pattern = r'([A-Za-z\s]+,\s*[A-Za-z\s]+,\s*[A-Z]{2,3})'
         addresses = re.findall(address_pattern, text)
         if addresses:
             contact_info['addresses'] = addresses[:2]
-        
+
         return contact_info
+
+    # ------------------------------------------------------------------
+    # Manual field correction: patch the JSON cache file in-place
+    # ------------------------------------------------------------------
+
+    def update_cache_fields(self, document_id: str, fields: Dict) -> bool:
+        """
+        Patch the extracted_data section of the JSON cache file for a given
+        document_id with user-corrected values.
+
+        Only keys present in `fields` are updated; all other fields are left
+        as-is.  Returns True if the file was found and updated, False otherwise.
+
+        Mapping from DocumentUpdate field names to extracted_data keys:
+          title, client, vendor, amount, currency, po_number,
+          invoice_number, msa_number, due_date
+        """
+        import json as _json
+
+        # Map DocumentUpdate field names → extracted_data JSON keys
+        FIELD_MAP = {
+            "title": "title",
+            "client": "client",
+            "vendor": "vendor",
+            "amount": "amount",
+            "currency": "currency",
+            "po_number": "po_number",
+            "invoice_number": "invoice_number",
+            "msa_number": "msa_number",
+            "due_date": "due_date",
+        }
+
+        if not os.path.exists(self.processed_dir):
+            return False
+
+        # Files are saved as {document_id}.json — target directly, no full-dir scan
+        json_path = os.path.join(self.processed_dir, f"{document_id}.json")
+        if not os.path.exists(json_path):
+            return False
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = _json.load(f)
+
+            # Patch extracted_data
+            extracted = data.setdefault('extracted_data', {})
+            for db_field, json_key in FIELD_MAP.items():
+                if db_field not in fields:
+                    continue
+                value = fields[db_field]
+                if value is not None:
+                    extracted[json_key] = value
+                elif db_field == "due_date":
+                    # Explicitly clear due_date when user sets it to null
+                    extracted.pop(json_key, None)
+
+            # Sync document_type with category if it changed
+            if "category" in fields and fields["category"]:
+                data["document_type"] = fields["category"]
+
+            with open(json_path, 'w', encoding='utf-8') as f:
+                _json.dump(data, f, indent=2, ensure_ascii=False)
+
+            return True
+
+        except Exception as e:
+            print(f"Warning: could not patch cache file {document_id}.json: {e}")
+            return False
