@@ -315,6 +315,30 @@ class RelinkService:
     # Step 6: Sync Document.client from financial records
     # ------------------------------------------------------------------
 
+    def _get_explicitly_unlinked_doc_ids(self) -> set:
+        """
+        Return the set of document IDs that were manually unlinked by the user
+        and currently have no active override link.  These must be skipped by
+        _sync_document_client_fields so that a relink run does not silently
+        re-assign the client that the user just removed.
+        """
+        from app.models import DocumentClientLink
+
+        active_ids = set(
+            row[0]
+            for row in self.db.query(DocumentClientLink.document_id)
+            .filter(DocumentClientLink.is_active == True)
+            .all()
+        )
+        inactive_ids = set(
+            row[0]
+            for row in self.db.query(DocumentClientLink.document_id)
+            .filter(DocumentClientLink.is_active == False)
+            .all()
+        )
+        # Explicitly unlinked = has at least one inactive record but no active one
+        return inactive_ids - active_ids
+
     def _sync_document_client_fields(self) -> int:
         """
         Back-propagate client_name from financial records → Document.client.
@@ -330,15 +354,24 @@ class RelinkService:
           - ClientPO      → Document (uses client_name)
           - VendorPO      → Document (resolves client_name via linked ClientPO)
           - VendorInvoice → Document (resolves client_name via VendorPO → ClientPO)
+
+        Documents that were explicitly unlinked by the user (inactive
+        DocumentClientLink, no active override) are skipped so the user's
+        action is not silently undone.
         """
         BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
         synced = 0
+
+        # Pre-fetch doc IDs the user has explicitly unlinked — do not re-assign these.
+        explicitly_unlinked = self._get_explicitly_unlinked_doc_ids()
 
         # Sync from ClientInvoice records
         for inv in self.db.query(ClientInvoice).all():
             if not inv.document_id or not inv.client_name:
                 continue
             if inv.client_name.strip().lower() in BLANK:
+                continue
+            if inv.document_id in explicitly_unlinked:
                 continue
             doc = self.db.query(Document).filter(Document.id == inv.document_id).first()
             if doc and (not doc.client or doc.client.strip().lower() in BLANK
@@ -353,6 +386,8 @@ class RelinkService:
                 continue
             if cpo.client_name.strip().lower() in BLANK:
                 continue
+            if cpo.document_id in explicitly_unlinked:
+                continue
             doc = self.db.query(Document).filter(Document.id == cpo.document_id).first()
             if doc and (not doc.client or doc.client.strip().lower() in BLANK
                         or doc.client != cpo.client_name):
@@ -364,6 +399,8 @@ class RelinkService:
         # (resolves client_name via the parent ClientPO)
         for vpo in self.db.query(VendorPO).filter(VendorPO.client_po_id.isnot(None)).all():
             if not vpo.document_id:
+                continue
+            if vpo.document_id in explicitly_unlinked:
                 continue
             cpo = self.db.query(ClientPO).filter(ClientPO.id == vpo.client_po_id).first()
             if not cpo or not cpo.client_name or cpo.client_name.strip().lower() in BLANK:
@@ -379,6 +416,8 @@ class RelinkService:
         # (resolves client_name via VendorPO → ClientPO)
         for vinv in self.db.query(VendorInvoice).filter(VendorInvoice.vendor_po_id.isnot(None)).all():
             if not vinv.document_id:
+                continue
+            if vinv.document_id in explicitly_unlinked:
                 continue
             vpo = self.db.query(VendorPO).filter(VendorPO.id == vinv.vendor_po_id).first()
             if not vpo or not vpo.client_po_id:

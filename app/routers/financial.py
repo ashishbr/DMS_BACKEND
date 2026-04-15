@@ -623,7 +623,7 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                     DocumentClientLink.client_name == client_name,
                     DocumentClientLink.is_active == True,
                 )
-                .subquery()
+                .scalar_subquery()
             )
 
             # PO numbers that belong to this client (used for automatic matching below)
