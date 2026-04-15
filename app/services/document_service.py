@@ -36,7 +36,32 @@ class DocumentService:
         return self.db.query(Document).filter(Document.id == document_id).first()
     
     def get_documents(self, skip: int = 0, limit: int = 100) -> List[Document]:
-        return self.db.query(Document).offset(skip).limit(limit).all()
+        from app.models import ClientInvoice, ClientPO
+        BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
+        docs = self.db.query(Document).offset(skip).limit(limit).all()
+
+        # Build a fast id→doc map
+        doc_map = {d.id: d for d in docs}
+
+        # Always sync client_name from ClientInvoice → Document for invoice docs
+        for ci in self.db.query(ClientInvoice).filter(
+            ClientInvoice.document_id.in_(doc_map.keys())
+        ).all():
+            if ci.client_name and ci.client_name.strip().lower() not in BLANK:
+                doc = doc_map.get(ci.document_id)
+                if doc:
+                    doc.client = ci.client_name
+
+        # Always sync client_name from ClientPO → Document for PO docs
+        for cpo in self.db.query(ClientPO).filter(
+            ClientPO.document_id.in_(doc_map.keys())
+        ).all():
+            if cpo.client_name and cpo.client_name.strip().lower() not in BLANK:
+                doc = doc_map.get(cpo.document_id)
+                if doc:
+                    doc.client = cpo.client_name
+
+        return docs
 
     def _load_documents_with_metadata(self) -> Tuple[List[Document], datetime, bool]:
         documents = self.db.query(Document).all()
@@ -323,7 +348,86 @@ class DocumentService:
         db_document = self.get_document(document_id)
         if not db_document:
             return False
-        
+
+        from app.models import (
+            ClientPO, VendorPO, ClientInvoice, VendorInvoice,
+            DocumentClientLink, GeneratedVendorPO,
+        )
+        from app.models import Exception as DocException, Alert
+
+        # ----------------------------------------------------------------
+        # 1. ClientPO linked to this document
+        #    POAllocation rows cascade-delete with the ClientPO (ORM cascade).
+        #    NULL out dependents that own their own document first:
+        #      - ClientInvoice.client_po_id
+        #      - VendorPO.client_po_id
+        # ----------------------------------------------------------------
+        cpo = self.db.query(ClientPO).filter(ClientPO.document_id == document_id).first()
+        if cpo:
+            self.db.query(ClientInvoice).filter(
+                ClientInvoice.client_po_id == cpo.id
+            ).update({"client_po_id": None}, synchronize_session=False)
+            self.db.query(VendorPO).filter(
+                VendorPO.client_po_id == cpo.id
+            ).update({"client_po_id": None}, synchronize_session=False)
+            self.db.delete(cpo)
+            self.db.flush()
+
+        # ----------------------------------------------------------------
+        # 2. VendorPO linked to this document
+        #    POAllocation rows cascade-delete with the VendorPO (ORM cascade).
+        #    NULL out dependents first:
+        #      - VendorInvoice.vendor_po_id
+        #      - GeneratedVendorPO.vendor_po_id
+        # ----------------------------------------------------------------
+        vpo = self.db.query(VendorPO).filter(VendorPO.document_id == document_id).first()
+        if vpo:
+            self.db.query(VendorInvoice).filter(
+                VendorInvoice.vendor_po_id == vpo.id
+            ).update({"vendor_po_id": None}, synchronize_session=False)
+            self.db.query(GeneratedVendorPO).filter(
+                GeneratedVendorPO.vendor_po_id == vpo.id
+            ).update({"vendor_po_id": None}, synchronize_session=False)
+            self.db.delete(vpo)
+            self.db.flush()
+
+        # ----------------------------------------------------------------
+        # 3. Invoice records that ARE this document
+        # ----------------------------------------------------------------
+        ci = self.db.query(ClientInvoice).filter(ClientInvoice.document_id == document_id).first()
+        if ci:
+            self.db.delete(ci)
+            self.db.flush()
+
+        vi = self.db.query(VendorInvoice).filter(VendorInvoice.document_id == document_id).first()
+        if vi:
+            self.db.delete(vi)
+            self.db.flush()
+
+        # ----------------------------------------------------------------
+        # 4. Manual client-link audit entries
+        # ----------------------------------------------------------------
+        self.db.query(DocumentClientLink).filter(
+            DocumentClientLink.document_id == document_id
+        ).delete(synchronize_session=False)
+
+        # ----------------------------------------------------------------
+        # 5. Exceptions (non-nullable FK — must go before the document row)
+        # ----------------------------------------------------------------
+        self.db.query(DocException).filter(
+            DocException.document_id == document_id
+        ).delete(synchronize_session=False)
+
+        # ----------------------------------------------------------------
+        # 6. Alerts (nullable FK — NULL out, keep the alert itself)
+        # ----------------------------------------------------------------
+        self.db.query(Alert).filter(
+            Alert.document_id == document_id
+        ).update({"document_id": None}, synchronize_session=False)
+
+        # ----------------------------------------------------------------
+        # 7. Delete the document row
+        # ----------------------------------------------------------------
         self.db.delete(db_document)
         self.db.commit()
         return True

@@ -52,6 +52,7 @@ class RelinkService:
             "vendor_invoices_linked": 0,
             "client_invoices_linked": 0,
             "statuses_advanced": 0,
+            "document_clients_synced": 0,
         }
 
         stats["vendor_pos_linked"] = self._link_vendor_pos_to_client_pos()
@@ -59,6 +60,7 @@ class RelinkService:
         stats["vendor_invoices_linked"] = self._link_vendor_invoices_to_pos()
         stats["client_invoices_linked"] = self._link_client_invoices_to_pos()
         stats["statuses_advanced"] = self._advance_statuses()
+        stats["document_clients_synced"] = self._sync_document_client_fields()
 
         self.db.commit()
         return stats
@@ -288,6 +290,55 @@ class RelinkService:
                 advanced += 1
 
         return advanced
+
+    # ------------------------------------------------------------------
+    # Step 6: Sync Document.client from financial records
+    # ------------------------------------------------------------------
+
+    def _sync_document_client_fields(self) -> int:
+        """
+        Back-propagate client_name from financial records → Document.client.
+
+        This keeps the Documents tab in sync with the Clients tab.
+        Without this step, a ClientInvoice can have client_name = "Acme Corp"
+        while its parent Document.client remains blank/Unknown Client, causing
+        the document-client-mapper to classify it as UNLINKED even though the
+        Clients tab correctly shows it under the right client.
+
+        Handles:
+          - ClientInvoice → Document (uses client_name)
+          - ClientPO      → Document (uses client_name)
+        """
+        BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
+        synced = 0
+
+        # Sync from ClientInvoice records
+        for inv in self.db.query(ClientInvoice).all():
+            if not inv.document_id or not inv.client_name:
+                continue
+            if inv.client_name.strip().lower() in BLANK:
+                continue
+            doc = self.db.query(Document).filter(Document.id == inv.document_id).first()
+            if doc and (not doc.client or doc.client.strip().lower() in BLANK
+                        or doc.client != inv.client_name):
+                doc.client = inv.client_name
+                self.db.flush()
+                synced += 1
+
+        # Sync from ClientPO records
+        for cpo in self.db.query(ClientPO).all():
+            if not cpo.document_id or not cpo.client_name:
+                continue
+            if cpo.client_name.strip().lower() in BLANK:
+                continue
+            doc = self.db.query(Document).filter(Document.id == cpo.document_id).first()
+            if doc and (not doc.client or doc.client.strip().lower() in BLANK
+                        or doc.client != cpo.client_name):
+                doc.client = cpo.client_name
+                self.db.flush()
+                synced += 1
+
+        return synced
 
     # ------------------------------------------------------------------
     # Utility

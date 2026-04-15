@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""  # Required: Set AWS_SECRET_ACCESS_KEY in .env
     aws_region: str = "us-east-1"  # Optional: Set AWS_REGION in .env (defaults to us-east-1)
     aws_s3_bucket: str = ""  # Required for S3-based processing: Set AWS_S3_BUCKET in .env
+    kb_s3_bucket: str = ""  # S3 bucket used as Bedrock Knowledge Base data source
     
     # File Upload
     upload_dir: str = "./uploads"
