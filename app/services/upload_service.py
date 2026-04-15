@@ -294,6 +294,24 @@ class UploadService:
             existing_data = self.pdf_processor._get_existing_processed_data(filename, existing_s3_key)
             if existing_data:
                 print(f"✅ Found existing processed data - returning cached result")
+                # Ensure the document exists in the DB even on a cache hit.
+                # Without this, documents whose processing was interrupted after
+                # the S3/JSON write but before the DB insert would never be saved.
+                if db and existing_data.get("success"):
+                    try:
+                        ex = existing_data.get("extracted_data", {})
+                        doc_type = existing_data.get("document_type")
+                        if not self._check_document_exists_in_db(filename, db, ex, doc_type):
+                            doc = self._save_to_database(existing_data, filename, db)
+                            if doc:
+                                from app.services.financial_classification_service import FinancialClassificationService
+                                FinancialClassificationService(db).classify_and_create(doc, ex)
+                                db.commit()
+                                existing_data["document_db_id"] = doc.id
+                                print(f"✅ Synced cached document to DB: {doc.id}")
+                    except Exception as sync_err:
+                        print(f"⚠️  DB sync from cache failed (non-fatal): {sync_err}")
+                        db.rollback()
                 return existing_data
             # If file exists in S3 but no processed data, check database one more time
             if db:
@@ -349,11 +367,15 @@ class UploadService:
 
                 # Save the processed document if successful
                 if result.get("success", False):
+                    # Embed the source filename so the cache file is self-contained
+                    # for repair operations (sync-cache-to-db endpoint).
+                    result["source_filename"] = filename
                     self.save_processed_document(result)
 
                     if db:
                         extracted_data = result.get("extracted_data", {})
-                        existing_doc = self._check_document_exists_in_db(filename, db, extracted_data)
+                        document_type = result.get("document_type")
+                        existing_doc = self._check_document_exists_in_db(filename, db, extracted_data, document_type)
                         if existing_doc:
                             print(f"⚠️  Document already exists in database (ID: {existing_doc.id}) - skipping save")
                             result["already_exists"] = True
@@ -474,8 +496,9 @@ class UploadService:
             msa_number=normalized_msa
         )
         
-        # Use the enhanced duplicate check method
-        existing_doc = self._check_document_exists_in_db(filename, db, extracted_data)
+        # Use the enhanced duplicate check method (pass document_type to prevent
+        # cross-category false positives, e.g. Vendor Invoice vs Client PO)
+        existing_doc = self._check_document_exists_in_db(filename, db, extracted_data, document_type)
         
         if existing_doc:
             updated = False
@@ -511,79 +534,101 @@ class UploadService:
     def get_file_path(self, filename: str) -> str:
         return os.path.join(self.upload_dir, filename)
     
-    def _check_document_exists_in_db(self, filename: str, db: Session, extracted_data: dict = None):
-        """Check if a document with this filename or similar data already exists in the database"""
+    def _check_document_exists_in_db(self, filename: str, db: Session, extracted_data: dict = None, document_type: str = None):
+        """Check if a document with this filename or similar data already exists in the database.
+
+        document_type is the classified category (e.g. "Vendor Invoice", "Client PO") and is
+        used to restrict cross-category false-positive matches.  An invoice document stores the
+        *referenced* PO number in po_number; without category filtering this caused Vendor
+        Invoices to be incorrectly identified as duplicates of the Client PO they reference.
+        """
         from app.models import Document
-        
+
         # Check by file_path (filename) - primary check
         existing = db.query(Document).filter(
             Document.file_path == filename
         ).first()
-        
+
         if existing:
             return existing
-        
+
         # Also check by original filename (in case file_path was modified)
-        # Extract base filename without extension for comparison
         base_name = os.path.splitext(filename)[0]
-        # Check if any document's file_path contains this base name
         existing = db.query(Document).filter(
             Document.file_path.isnot(None),
             Document.file_path.contains(base_name)
         ).first()
-        
+
         if existing:
             return existing
-        
-        # If we have extracted data, check by invoice number or PO number
+
         if extracted_data:
-            # Check by invoice number (for invoices)
+            # ── Invoice-number dedup (invoices only) ──────────────────────────
             invoice_number = extracted_data.get("invoice_number")
             if invoice_number:
+                inv_cats = (
+                    [document_type]
+                    if document_type in ("Client Invoice", "Vendor Invoice")
+                    else ["Client Invoice", "Vendor Invoice"]
+                )
                 existing = db.query(Document).filter(
                     Document.invoice_number == invoice_number,
-                    Document.category.in_(["Client Invoice", "Vendor Invoice"])
+                    Document.category.in_(inv_cats),
                 ).first()
                 if existing:
                     return existing
-            
-            # Check by PO number (for POs)
+
+            # ── PO-number dedup (PO documents only) ───────────────────────────
+            # Invoices carry a *reference* po_number (the PO they bill against).
+            # Matching on that reference across categories would wrongly collapse
+            # a Vendor Invoice into its parent Client PO or Vendor PO.
             po_number = extracted_data.get("po_number")
-            if po_number:
+            if po_number and document_type in ("Client PO", "Vendor PO", None):
+                po_cats = (
+                    [document_type]
+                    if document_type in ("Client PO", "Vendor PO")
+                    else ["Client PO", "Vendor PO"]
+                )
                 existing = db.query(Document).filter(
                     Document.po_number == po_number,
-                    Document.category.in_(["Client PO", "Vendor PO"])
+                    Document.category.in_(po_cats),
                 ).first()
                 if existing:
                     return existing
-            
-            # Check by title + amount + client (for documents without invoice/PO numbers)
+
+            # ── Title + amount dedup (same category only) ─────────────────────
+            # Without category filtering a Vendor Invoice and its parent Client PO
+            # can share the same sanitized title (the PO number) and amount,
+            # causing the second document to be silently dropped.
             title = extracted_data.get("title")
             amount = extracted_data.get("amount")
             client = extracted_data.get("client")
-            
+
             if title and amount:
-                # Match by title and amount (within 1% tolerance)
-                # This catches duplicates even if client name extraction varies slightly
-                amount_tolerance = amount * 0.01  # 1% tolerance
-                existing = db.query(Document).filter(
+                amount_tolerance = amount * 0.01
+                q = db.query(Document).filter(
                     Document.title == title,
                     Document.amount >= amount - amount_tolerance,
-                    Document.amount <= amount + amount_tolerance
-                ).first()
+                    Document.amount <= amount + amount_tolerance,
+                )
+                if document_type:
+                    q = q.filter(Document.category == document_type)
+                existing = q.first()
                 if existing:
                     return existing
-                
-                # Also check by amount and client if client is available
+
                 if client and client != "Unknown Client":
-                    existing = db.query(Document).filter(
+                    q2 = db.query(Document).filter(
                         Document.client == client,
                         Document.amount >= amount - amount_tolerance,
-                        Document.amount <= amount + amount_tolerance
-                    ).first()
+                        Document.amount <= amount + amount_tolerance,
+                    )
+                    if document_type:
+                        q2 = q2.filter(Document.category == document_type)
+                    existing = q2.first()
                     if existing:
                         return existing
-        
+
         return None
     
     def delete_file(self, filename: str) -> bool:

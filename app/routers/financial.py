@@ -614,26 +614,107 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                 i for i in client_invoices_by_name if i.id not in po_linked_inv_ids
             ]
 
-            # Vendor POs linked to any of this client's POs
-            vendor_pos = (
+            from app.models import Document, DocumentClientLink
+
+            # DocumentClientLink-based doc IDs for this client (used for vendors AND linked_docs)
+            doc_link_subq = (
+                db.query(DocumentClientLink.document_id)
+                .filter(
+                    DocumentClientLink.client_name == client_name,
+                    DocumentClientLink.is_active == True,
+                )
+                .subquery()
+            )
+
+            # PO numbers that belong to this client (used for automatic matching below)
+            cpo_po_numbers = {cpo.po_number for cpo in cpos if cpo.po_number}
+
+            # ── Vendor POs ──────────────────────────────────────────────────
+            # Source 1: FK chain — VendorPO.client_po_id points to one of this client's POs
+            vendor_pos_fk = (
                 db.query(VendorPO)
                 .filter(VendorPO.client_po_id.in_(client_po_ids))
                 .all()
             )
+            seen_vpo_ids = {v.id for v in vendor_pos_fk}
 
-            # Group vendor POs by vendor name
+            # Source 2: PO number match — VendorPO.vendor_po_number == ClientPO.po_number
+            # (automatic: no manual mapping needed)
+            vendor_pos_po_num = (
+                db.query(VendorPO)
+                .filter(
+                    VendorPO.vendor_po_number.in_(cpo_po_numbers),
+                    VendorPO.client_po_id.is_(None),
+                )
+                .all()
+            ) if cpo_po_numbers else []
+
+            # Source 3: DocumentClientLink — manually assigned in Document mapper
+            vendor_pos_doc = (
+                db.query(VendorPO)
+                .filter(
+                    VendorPO.document_id.in_(doc_link_subq),
+                    VendorPO.client_po_id.is_(None),
+                )
+                .all()
+            )
+
+            # Merge all, dedup by id
             vendors_map: dict = {}
-            for vpo in vendor_pos:
+            for vpo in vendor_pos_fk:
                 vendors_map.setdefault(vpo.vendor_name, []).append(vpo)
+            for vpo in vendor_pos_po_num + vendor_pos_doc:
+                if vpo.id not in seen_vpo_ids:
+                    seen_vpo_ids.add(vpo.id)
+                    vendors_map.setdefault(vpo.vendor_name, []).append(vpo)
+
+            # ── Vendor Invoices with no VendorPO link ───────────────────────
+            # Source A: document's po_number matches one of this client's ClientPO po_numbers
+            # (automatic: covers invoices whose VendorPO wasn't in DB at upload time)
+            orphan_inv_by_po = (
+                db.query(VendorInvoice)
+                .join(Document, VendorInvoice.document_id == Document.id)
+                .filter(
+                    Document.po_number.in_(cpo_po_numbers),
+                    VendorInvoice.vendor_po_id.is_(None),
+                )
+                .all()
+            ) if cpo_po_numbers else []
+
+            # Source B: DocumentClientLink — manually assigned, no VendorPO
+            orphan_inv_by_doc = (
+                db.query(VendorInvoice)
+                .filter(
+                    VendorInvoice.document_id.in_(doc_link_subq),
+                    VendorInvoice.vendor_po_id.is_(None),
+                )
+                .all()
+            )
+
+            orphan_inv_map: dict = {}
+            seen_orphan = set()
+            for inv in orphan_inv_by_po + orphan_inv_by_doc:
+                if inv.id not in seen_orphan:
+                    seen_orphan.add(inv.id)
+                    orphan_inv_map.setdefault(inv.vendor_name, []).append(inv)
+
+            # Ensure vendors with only orphan invoices still appear
+            for vname in orphan_inv_map:
+                if vname not in vendors_map:
+                    vendors_map[vname] = []
 
             vendors_result = []
             for vendor_name, vpos in vendors_map.items():
                 vpo_ids = [vpo.id for vpo in vpos]
-                invoices = (
+                invoices_by_po = (
                     db.query(VendorInvoice)
                     .filter(VendorInvoice.vendor_po_id.in_(vpo_ids))
                     .all()
-                )
+                ) if vpo_ids else []
+                invoices_orphan = orphan_inv_map.get(vendor_name, [])
+                seen_inv = {i.id for i in invoices_by_po}
+                invoices = invoices_by_po + [i for i in invoices_orphan if i.id not in seen_inv]
+
                 vendors_result.append(VendorWithInvoices(
                     vendor_name=vendor_name,
                     vendor_pos=[VendorPOResponse.model_validate(v) for v in vpos],
@@ -642,22 +723,9 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                     invoices=[VendorInvoiceResponse.model_validate(i) for i in invoices],
                 ))
 
-            from app.models import Document, DocumentClientLink
-            # Use DocumentClientLink as the authoritative source for manual
-            # assignments — keeps this in sync with the Documents tab which
-            # writes/reads the same table. Avoids divergence caused by
-            # Document.client being stale or case-mismatched against client_name.
-            linked_doc_ids = (
-                db.query(DocumentClientLink.document_id)
-                .filter(
-                    DocumentClientLink.client_name == client_name,
-                    DocumentClientLink.is_active == True,
-                )
-                .subquery()
-            )
             linked_docs = (
                 db.query(Document)
-                .filter(Document.id.in_(linked_doc_ids))
+                .filter(Document.id.in_(doc_link_subq))
                 .order_by(Document.created_at.desc())
                 .all()
             )

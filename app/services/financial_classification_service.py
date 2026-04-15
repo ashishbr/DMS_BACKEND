@@ -326,14 +326,22 @@ class FinancialClassificationService:
         self, data: Dict[str, Any], document: Document
     ) -> Optional[str]:
         """Try to match a Vendor PO to an existing Client PO."""
-        # 1. By explicit PO number reference in extracted data
+        # 1. By explicit cross-reference field in extracted data
         ref_po = data.get("client_po_number") or data.get("reference_po_number")
         if ref_po:
             cpo = self.client_po_repo.get_by_po_number(ref_po)
             if cpo:
                 return cpo.id
 
-        # 2. By client name + optional msa_number
+        # 2. By the main po_number field — Vendor POs often share the same PO number
+        #    as the Client PO they were issued under (e.g. both reference "PO-2025-101")
+        po_num = data.get("po_number") or document.po_number
+        if po_num:
+            cpo = self.client_po_repo.get_by_po_number(po_num)
+            if cpo:
+                return cpo.id
+
+        # 3. By client name + optional msa_number
         msa = data.get("msa_number") or document.msa_number
         client = _normalize_client(data.get("client") or document.client)
         if client and client != "Unknown Client":
