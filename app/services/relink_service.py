@@ -82,20 +82,25 @@ class RelinkService:
         )
         linked = 0
         for vpo in unlinked:
-            client_name = self._get_client_name_for_vendor_po(vpo)
-            if not client_name:
-                continue
+            cpo = None
 
-            candidates = self.client_po_repo.get_by_client_name(client_name)
-            if not candidates:
-                continue
+            # Strategy 1: vendor_po_number matches a ClientPO's po_number
+            # (e.g. both documents reference the same project PO — "PO-2025-101")
+            if vpo.vendor_po_number:
+                cpo = self.client_po_repo.get_by_po_number(vpo.vendor_po_number)
 
-            # Prefer unique match; if multiple POs for same client, pick the ACTIVE/latest one
-            cpo = (
-                candidates[0]
-                if len(candidates) == 1
-                else self._pick_best_client_po(candidates)
-            )
+            # Strategy 2: client name from Document.client or DocumentClientLink
+            if not cpo:
+                client_name = self._get_client_name_for_vendor_po(vpo)
+                if client_name:
+                    candidates = self.client_po_repo.get_by_client_name(client_name)
+                    if candidates:
+                        cpo = (
+                            candidates[0]
+                            if len(candidates) == 1
+                            else self._pick_best_client_po(candidates)
+                        )
+
             if cpo:
                 vpo.client_po_id = cpo.id
                 self.db.flush()
@@ -104,11 +109,26 @@ class RelinkService:
         return linked
 
     def _get_client_name_for_vendor_po(self, vpo: VendorPO) -> str:
-        """Resolve client name from the linked Document row (if any)."""
+        """Resolve client name from the linked Document row or DocumentClientLink."""
+        BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
         if vpo.document_id:
             doc = self.db.query(Document).filter(Document.id == vpo.document_id).first()
-            if doc and doc.client and doc.client != "Unknown Client":
-                return doc.client
+            if doc:
+                # 1. Direct Document.client field
+                if doc.client and doc.client.strip().lower() not in BLANK:
+                    return doc.client
+                # 2. DocumentClientLink — manual assignment from Document mapper
+                from app.models import DocumentClientLink
+                link = (
+                    self.db.query(DocumentClientLink)
+                    .filter(
+                        DocumentClientLink.document_id == vpo.document_id,
+                        DocumentClientLink.is_active == True,
+                    )
+                    .first()
+                )
+                if link and link.client_name and link.client_name.strip().lower() not in BLANK:
+                    return link.client_name
         return ""
 
     def _pick_best_client_po(self, candidates):
@@ -308,6 +328,8 @@ class RelinkService:
         Handles:
           - ClientInvoice → Document (uses client_name)
           - ClientPO      → Document (uses client_name)
+          - VendorPO      → Document (resolves client_name via linked ClientPO)
+          - VendorInvoice → Document (resolves client_name via VendorPO → ClientPO)
         """
         BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
         synced = 0
@@ -332,6 +354,39 @@ class RelinkService:
             if cpo.client_name.strip().lower() in BLANK:
                 continue
             doc = self.db.query(Document).filter(Document.id == cpo.document_id).first()
+            if doc and (not doc.client or doc.client.strip().lower() in BLANK
+                        or doc.client != cpo.client_name):
+                doc.client = cpo.client_name
+                self.db.flush()
+                synced += 1
+
+        # Sync from VendorPO records that are linked to a ClientPO
+        # (resolves client_name via the parent ClientPO)
+        for vpo in self.db.query(VendorPO).filter(VendorPO.client_po_id.isnot(None)).all():
+            if not vpo.document_id:
+                continue
+            cpo = self.db.query(ClientPO).filter(ClientPO.id == vpo.client_po_id).first()
+            if not cpo or not cpo.client_name or cpo.client_name.strip().lower() in BLANK:
+                continue
+            doc = self.db.query(Document).filter(Document.id == vpo.document_id).first()
+            if doc and (not doc.client or doc.client.strip().lower() in BLANK
+                        or doc.client != cpo.client_name):
+                doc.client = cpo.client_name
+                self.db.flush()
+                synced += 1
+
+        # Sync from VendorInvoice records that are linked to a VendorPO
+        # (resolves client_name via VendorPO → ClientPO)
+        for vinv in self.db.query(VendorInvoice).filter(VendorInvoice.vendor_po_id.isnot(None)).all():
+            if not vinv.document_id:
+                continue
+            vpo = self.db.query(VendorPO).filter(VendorPO.id == vinv.vendor_po_id).first()
+            if not vpo or not vpo.client_po_id:
+                continue
+            cpo = self.db.query(ClientPO).filter(ClientPO.id == vpo.client_po_id).first()
+            if not cpo or not cpo.client_name or cpo.client_name.strip().lower() in BLANK:
+                continue
+            doc = self.db.query(Document).filter(Document.id == vinv.document_id).first()
             if doc and (not doc.client or doc.client.strip().lower() in BLANK
                         or doc.client != cpo.client_name):
                 doc.client = cpo.client_name
