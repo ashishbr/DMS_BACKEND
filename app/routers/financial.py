@@ -470,6 +470,14 @@ async def create_client_invoice(payload: ClientInvoiceCreate, db: Session = Depe
                 cpo.status = "ACTIVE"
                 db.flush()
 
+        # Sync Document.client so the Documents tab shows this as linked
+        if created.document_id and created.client_name:
+            from app.models import Document as DocumentModel
+            doc = db.query(DocumentModel).filter(DocumentModel.id == created.document_id).first()
+            if doc and doc.client != created.client_name:
+                doc.client = created.client_name
+                db.flush()
+
         db.commit()
 
         # Refresh alerts for the linked document
@@ -530,6 +538,31 @@ async def relink_documents(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # CLIENTS OVERVIEW  (hierarchical: client → vendors → invoices)
 # ---------------------------------------------------------------------------
+
+@router.get("/clients", response_model=List[str])
+async def get_client_names(db: Session = Depends(get_db)):
+    """
+    Returns a sorted, deduplicated list of all known client names.
+    Draws from both ClientPO records and active DocumentClientLink entries
+    so manually linked clients appear even before a ClientPO is created.
+    """
+    from app.models import DocumentClientLink
+
+    BLANK = {"", "unknown", "unknown client", "unknown vendor", "n/a"}
+
+    po_names = {row[0] for row in db.query(ClientPO.client_name).all()}
+    link_names = {
+        row[0]
+        for row in db.query(DocumentClientLink.client_name)
+        .filter(DocumentClientLink.is_active == True)
+        .all()
+    }
+    names = sorted(
+        n for n in (po_names | link_names)
+        if n and n.strip().lower() not in BLANK
+    )
+    return names
+
 
 @router.get("/clients-overview", response_model=ClientsOverviewResponse)
 async def get_clients_overview(db: Session = Depends(get_db)):
@@ -609,10 +642,22 @@ async def get_clients_overview(db: Session = Depends(get_db)):
                     invoices=[VendorInvoiceResponse.model_validate(i) for i in invoices],
                 ))
 
-            from app.models import Document
+            from app.models import Document, DocumentClientLink
+            # Use DocumentClientLink as the authoritative source for manual
+            # assignments — keeps this in sync with the Documents tab which
+            # writes/reads the same table. Avoids divergence caused by
+            # Document.client being stale or case-mismatched against client_name.
+            linked_doc_ids = (
+                db.query(DocumentClientLink.document_id)
+                .filter(
+                    DocumentClientLink.client_name == client_name,
+                    DocumentClientLink.is_active == True,
+                )
+                .subquery()
+            )
             linked_docs = (
                 db.query(Document)
-                .filter(Document.client == client_name)
+                .filter(Document.id.in_(linked_doc_ids))
                 .order_by(Document.created_at.desc())
                 .all()
             )

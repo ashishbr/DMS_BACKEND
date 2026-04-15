@@ -597,21 +597,63 @@ class UploadService:
             return False
     
     def save_processed_document(self, result: dict) -> bool:
-        """Save processed document result to JSON file"""
+        """Save processed document result to JSON file and push to KB S3 bucket."""
         try:
             import json
             processed_dir = "./processed"
             os.makedirs(processed_dir, exist_ok=True)
-            
+
             # Create filename from document ID
             document_id = result.get('document_id', 'unknown')
             filename = f"{document_id}.json"
             file_path = os.path.join(processed_dir, filename)
-            
-            # Save the result
+
+            # Save the result locally
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
-            
+
+            # Push a plain-text version to the KB S3 bucket so Bedrock can index it
+            if settings.kb_s3_bucket:
+                try:
+                    import boto3
+                    ex = result.get("extracted_data", {})
+                    key_terms = ex.get("key_terms") or []
+                    if isinstance(key_terms, list):
+                        key_terms = ", ".join(str(t) for t in key_terms)
+
+                    kb_text = f"""Document ID: {document_id}
+                    Document Type: {result.get('document_type', '')}
+                    Title: {ex.get('title', '')}
+                    Client: {ex.get('client', '')}
+                    Vendor: {ex.get('vendor', '')}
+                    Amount: {ex.get('amount', '')} {ex.get('currency', '')}
+                    Date: {ex.get('date', '')}
+                    Due Date: {ex.get('due_date', '')}
+                    PO Number: {ex.get('po_number', '')}
+                    Invoice Number: {ex.get('invoice_number', '')}
+                    MSA Number: {ex.get('msa_number', '')}
+                    Vendor Address: {ex.get('vendor_address', '')}
+                    Client Address: {ex.get('client_address', '')}
+                    Summary: {ex.get('summary', '')}
+                    Key Terms: {key_terms}
+                    """
+                    s3 = boto3.client(
+                        "s3",
+                        aws_access_key_id=settings.aws_access_key_id,
+                        aws_secret_access_key=settings.aws_secret_access_key,
+                        region_name=settings.aws_region,
+                    )
+                    s3.put_object(
+                        Bucket=settings.kb_s3_bucket,
+                        Key=f"processed/{document_id}.txt",
+                        Body=kb_text.encode("utf-8"),
+                        ContentType="text/plain",
+                    )
+                    print(f"✅ KB S3 upload: processed/{document_id}.txt → {settings.kb_s3_bucket}")
+                except Exception as kb_err:
+                    # Non-fatal — local save already succeeded
+                    print(f"⚠️  KB S3 upload failed (non-fatal): {kb_err}")
+
             return True
         except Exception as e:
             print(f"Error saving processed document: {e}")

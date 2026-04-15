@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings
 from app.database import engine, SessionLocal
 from app.models import Base
@@ -16,28 +16,30 @@ from app.routers import vendor_po as vendor_po_router
 Base.metadata.create_all(bind=engine)
 
 
-def _run_relink():
-    """Scheduled job: re-link documents and advance statuses every hour."""
+async def _run_relink():
+    """Scheduled job: re-link documents and advance statuses every 1 minute."""
     db = SessionLocal()
     try:
         from app.services.relink_service import RelinkService
         stats = RelinkService(db).run_full_relink()
         print(f"[scheduler] relink completed: {stats}")
     except Exception as exc:
+        import traceback
         print(f"[scheduler] relink failed: {exc}")
+        print(traceback.format_exc())
         db.rollback()
     finally:
         db.close()
 
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(_run_relink, "interval", minutes=5, id="relink_job")
+scheduler = AsyncIOScheduler()
+scheduler.add_job(_run_relink, "interval", minutes=1, id="relink_job")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.start()
-    print("[scheduler] relink job started — runs every 5 minutes")
+    print("[scheduler] relink job started — runs every 1 minute")
     yield
     scheduler.shutdown(wait=False)
     print("[scheduler] stopped")
