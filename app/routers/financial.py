@@ -38,7 +38,7 @@ from app.schemas import (
     MarginSummary, ClientPOLineage,
     VendorPOConsumption, BillingViolationsResponse, GlobalMarginSummary,
     VendorWithInvoices, ClientWithVendors, ClientsOverviewResponse,
-    ClientRenameRequest, LinkedDocumentSummary,
+    ClientRenameRequest, LinkedDocumentSummary, ClientCreateRequest,
 )
 
 router = APIRouter(prefix="/api/financial", tags=["financial"])
@@ -538,6 +538,35 @@ async def relink_documents(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # CLIENTS OVERVIEW  (hierarchical: client → vendors → invoices)
 # ---------------------------------------------------------------------------
+
+@router.post("/clients", response_model=ClientPOResponse, status_code=201)
+async def create_client(payload: ClientCreateRequest, db: Session = Depends(get_db)):
+    """Create a standalone client (ClientPO with no document attached)."""
+    BLANK = {"", "unknown", "unknown client", "n/a"}
+    name = payload.client_name.strip()
+    if not name or name.lower() in BLANK:
+        raise HTTPException(status_code=422, detail="Invalid client name")
+
+    existing = db.query(ClientPO).filter(ClientPO.client_name == name, ClientPO.document_id.is_(None)).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Client '{name}' already exists")
+
+    client_po = ClientPO(
+        id=str(uuid.uuid4()),
+        document_id=None,
+        po_number=f"MANUAL-{uuid.uuid4().hex[:8].upper()}",
+        client_name=name,
+        total_value=0.0,
+        currency=payload.currency,
+        service_scope=payload.service_scope,
+        msa_number=payload.msa_number,
+        status="DRAFT",
+    )
+    db.add(client_po)
+    db.commit()
+    db.refresh(client_po)
+    return ClientPOResponse.model_validate(client_po)
+
 
 @router.get("/clients", response_model=List[str])
 async def get_client_names(db: Session = Depends(get_db)):
