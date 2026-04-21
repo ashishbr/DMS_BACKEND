@@ -222,7 +222,7 @@ class MSABucketResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ClientPOCreate(BaseModel):
-    document_id: str
+    document_id: Optional[str] = None
     po_number: str
     client_name: str
     total_value: float
@@ -250,7 +250,7 @@ class ClientPOUpdate(BaseModel):
 
 class ClientPOResponse(BaseModel):
     id: str
-    document_id: str
+    document_id: Optional[str] = None
     po_number: str
     client_name: str
     total_value: float
@@ -670,6 +670,13 @@ class GeneratedVendorPOResponse(BaseModel):
 
 class ClientRenameRequest(BaseModel):
     new_name: str
+
+
+class ClientCreateRequest(BaseModel):
+    client_name: str
+    currency: str = "USD"
+    service_scope: Optional[str] = None
+    msa_number: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

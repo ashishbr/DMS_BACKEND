@@ -74,7 +74,7 @@ class ClientPO(Base):
     __tablename__ = "client_pos"
 
     id = Column(String, primary_key=True, index=True)
-    document_id = Column(String, ForeignKey("documents.id"), nullable=False, unique=True)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=True, unique=True)
     po_number = Column(String, nullable=False, index=True)
     client_name = Column(String, nullable=False, index=True)
     total_value = Column(Float, nullable=False)

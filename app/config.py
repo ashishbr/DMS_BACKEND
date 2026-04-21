@@ -47,16 +47,5 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Debug: Print AWS configuration status (without exposing secrets)
-print("🔧 AWS Configuration Check:")
-print(f"   AWS_ACCESS_KEY_ID set: {bool(settings.aws_access_key_id)}")
-print(f"   AWS_SECRET_ACCESS_KEY set: {bool(settings.aws_secret_access_key)}")
-print(f"   AWS_REGION: {settings.aws_region}")
-print(f"   AWS_S3_BUCKET set: {bool(settings.aws_s3_bucket)}")
-if settings.aws_s3_bucket:
-    print(f"   AWS_S3_BUCKET value: {settings.aws_s3_bucket}")
-else:
-    print("   ⚠️  AWS_S3_BUCKET is empty or not set!")
-
 # Create upload directory if it doesn't exist
 os.makedirs(settings.upload_dir, exist_ok=True)

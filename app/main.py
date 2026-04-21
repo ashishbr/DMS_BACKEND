@@ -15,6 +15,16 @@ from app.routers import vendor_po as vendor_po_router
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
+# Make client_pos.document_id nullable for manually-created clients
+try:
+    with engine.connect() as _conn:
+        _conn.execute(__import__("sqlalchemy").text(
+            "ALTER TABLE client_pos ALTER COLUMN document_id DROP NOT NULL"
+        ))
+        _conn.commit()
+except Exception:
+    pass  # already nullable or SQLite (which ignores NOT NULL alterations)
+
 
 async def _run_relink():
     """Scheduled job: re-link documents and advance statuses every 1 minute."""
@@ -38,6 +48,12 @@ scheduler.add_job(_run_relink, "interval", minutes=1, id="relink_job")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("🔧 AWS Configuration Check:")
+    print(f"   AWS_ACCESS_KEY_ID set: {bool(settings.aws_access_key_id)}")
+    print(f"   AWS_SECRET_ACCESS_KEY set: {bool(settings.aws_secret_access_key)}")
+    print(f"   AWS_REGION: {settings.aws_region}")
+    print(f"   AWS_S3_BUCKET: {settings.aws_s3_bucket or '⚠️  not set'}")
+    print(f"   AWS_S3_KB_BUCKET: {settings.kb_s3_bucket or '⚠️  not set'}")
     scheduler.start()
     print("[scheduler] relink job started — runs every 1 minute")
     yield
